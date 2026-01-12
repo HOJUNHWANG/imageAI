@@ -1,0 +1,12 @@
+# 가상환경
+ai_env/
+venv/
+__pycache__/
+
+# 대용량 모델 가중치
+weights/*.pth
+
+# 결과물 및 임시 파일
+outputs/
+*.png
+*.jpg
