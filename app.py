@@ -1,102 +1,268 @@
+import os
+import numpy as np
 import gradio as gr
 import torch
-import numpy as np
 from PIL import Image
+
 from diffusers import AutoPipelineForInpainting
-from sam_utils import AutoMasker
-import os
 
-# 1. 환경 설정 및 모델 로드
-device = "cuda" if torch.cuda.is_available() else "cpu"
-base_path = os.path.dirname(__file__)
-sam_checkpoint = os.path.join(base_path, "weights", "sam_vit_h_4b8939.pth")
-
-print(f"현재 사용 중인 장치: {device}")
-print("AI 모델들을 로딩 중입니다... (3080 Ti 최적화 모드)")
-
-# SAM 모델 로드 (수정한 sam_utils 사용)
-masker = AutoMasker(sam_checkpoint, device=device)
-
-# SDXL Inpainting 모델 로드
-pipe = AutoPipelineForInpainting.from_pretrained(
-    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
-    torch_dtype=torch.float16,
-    variant="fp16",
-    use_safetensors=True
+from sam_utils import SamMaskerManager
+from image_utils import (
+    to_rgb_pil,
+    resize_long_side,
+    postprocess_mask,
+    mask_to_pil,
+    overlay_mask_on_image,
 )
 
-if device == "cuda":
-    # 1. 3080 Ti 메모리 최적화의 핵심
-    # 모델 전체를 GPU에 올리지 않고, 실행되는 레이어만 순차적으로 올려서 VRAM 부족을 방지합니다.
-    pipe.enable_sequential_cpu_offload() 
-    
-    # 2. 어텐션 연산을 쪼개서 처리하여 메모리 피크치를 낮춥니다.
-    pipe.enable_attention_slicing()
-    
-    # 3. VAE(이미지 복원) 단계에서의 메모리 부족을 방지합니다.
-    pipe.enable_vae_tiling()
-    
-    print("3080 Ti 최적화 모드(Sequential Offload) 활성화 완료.")
+# -----------------------------------------------------------------------------
+# Runtime switches (환경에 따라 동작을 바꾸기 위한 플래그들)
+# -----------------------------------------------------------------------------
+# GPU 없는 PC에서 테스트할 때:
+#   MOCK_INPAINT=1 python app.py
+# => Diffusion 모델 로딩/추론을 생략하고, 마스크 오버레이로 UI 동작만 확인 가능.
+MOCK_INPAINT = os.environ.get("MOCK_INPAINT", "0") == "1"
 
-# 전역 변수로 마스크와 이미지 저장
-current_mask = None
-last_uploaded_img = None
+# CPU에서 Diffusers를 억지로 돌리면 SDXL은 매우 느림.
+# CPU 테스트를 "실제 생성"까지 하려면 작은 모델로 바꿔서 512 정도로 돌리는 게 현실적임.
+# 필요하면 아래 MODEL_ID를 SD 1.5 inpaint 모델로 변경:
+#   e.g. runwayml/stable-diffusion-inpainting (환경에 따라 접근 가능)
+MODEL_ID = os.environ.get(
+    "INPAINT_MODEL_ID",
+    "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+)
 
-# 2. 로직 함수
-def on_select(img, evt: gr.SelectData):
-    global current_mask, last_uploaded_img
-    
-    # PIL 이미지를 numpy로 변환
-    img_rgb = np.array(img.convert("RGB"))
-    
-    # 마스크 생성 (이미지 임베딩은 바뀌었을 때만 sam_utils에서 처리됨)
-    mask_np = masker.generate_mask(img_rgb, evt.index[0], evt.index[1])
-    current_mask = Image.fromarray(mask_np)
-    
-    # 화면 표시용 오버레이 생성
-    overlay = img_rgb.copy()
-    overlay[mask_np > 0] = [255, 0, 0] # 마스크 영역을 빨간색으로 표시
-    
-    return Image.fromarray(overlay), "마스크 생성 완료! 프롬프트를 입력하고 Apply를 누르세요."
+# -----------------------------------------------------------------------------
+# Device / performance knobs
+# -----------------------------------------------------------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-def run_inpaint(img, prompt):
-    global current_mask
-    if current_mask is None:
-        return None, "오류: 먼저 이미지에서 수정할 부분을 클릭해 마스크를 만들어주세요!"
-    
-    print(f"이미지 생성 시작... 프롬프트: {prompt}")
-    
-    # 생성 실행 (3080 Ti 기준 약 10~15초 소요)
+# TF32는 Ampere(30xx)에서 matmul 성능을 올려주는 옵션.
+# 모델 정확도에 영향이 있을 수 있으나 보통 이미지 생성에서는 체감이 크지 않음.
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# -----------------------------------------------------------------------------
+# Global state (Gradio 이벤트 간 공유)
+# -----------------------------------------------------------------------------
+STATE = {
+    "working_pil": None,    # SAM+Inpaint용 작업 이미지(리사이즈된 PIL)
+    "working_np": None,     # SAM 입력용 numpy (RGB)
+    "mask_np": None,        # uint8 (H, W), 0/255
+}
+
+# -----------------------------------------------------------------------------
+# Load SAM manager (vit_b / vit_h)
+# -----------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(__file__)
+WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
+
+sam_manager = SamMaskerManager(weights_dir=WEIGHTS_DIR, device=DEVICE)
+
+# -----------------------------------------------------------------------------
+# Load inpaint pipeline (optional in MOCK mode)
+# -----------------------------------------------------------------------------
+pipe = None
+if not MOCK_INPAINT:
+    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
+    variant = "fp16" if DEVICE == "cuda" else None
+
+    pipe = AutoPipelineForInpainting.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        variant=variant,
+        use_safetensors=True,
+    ).to(DEVICE)
+
+    # xformers가 있으면 attention을 더 효율적으로 처리해서 빨라질 수 있음.
+    if DEVICE == "cuda":
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("[OK] xformers enabled")
+        except Exception as e:
+            print("[WARN] xformers not available:", e)
+
+    pipe.set_progress_bar_config(disable=True)
+
+print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}, MODEL_ID={MODEL_ID}")
+
+# -----------------------------------------------------------------------------
+# Handlers
+# -----------------------------------------------------------------------------
+def on_upload(img_pil: Image.Image, work_long_side: int):
+    """
+    업로드 시:
+    - 입력 이미지를 RGB로 정규화
+    - 작업 해상도(working)로 리사이즈해서 저장
+    - 마스크 초기화
+    """
+    if img_pil is None:
+        return None, None, "Upload an image."
+
+    img_pil = to_rgb_pil(img_pil)
+
+    # 작업 이미지 고정(좌표/마스크/모델 입력을 동일 스케일로 유지)
+    working = resize_long_side(img_pil, int(work_long_side))
+    working_np = np.array(working)  # RGB
+
+    STATE["working_pil"] = working
+    STATE["working_np"] = working_np
+    STATE["mask_np"] = None
+
+    return working, None, f"Loaded. Working size={working.size}. Click to create a mask."
+
+def on_click(evt: gr.SelectData, sam_model_type: str, expand_px: int, blur_px: int):
+    """
+    클릭 시:
+    - SAM으로 마스크 생성
+    - 후처리(확장/블러)
+    - 마스크 프리뷰 반환
+    """
+    if STATE["working_np"] is None:
+        return None, "Upload an image first."
+
+    x, y = evt.index
+    img_np = STATE["working_np"]
+
+    masker = sam_manager.get(sam_model_type)
+    raw_mask = masker.mask_from_click(img_np, int(x), int(y))
+
+    mask = postprocess_mask(raw_mask, int(expand_px), int(blur_px))
+    STATE["mask_np"] = mask
+
+    return mask_to_pil(mask), f"Mask created at ({x},{y})."
+
+@torch.inference_mode()
+def apply_edit(
+    sam_model_type: str,
+    prompt: str,
+    negative_prompt: str,
+    steps: int,
+    strength: float,
+    guidance_scale: float,
+    expand_px: int,
+    blur_px: int,
+):
+    """
+    Apply 버튼:
+    - 마스크 유효성 체크
+    - (선택) 마스크 후처리 재적용
+    - MOCK 모드면 오버레이만 반환
+    - 실제 모드면 inpaint 실행
+    """
+    if STATE["working_pil"] is None:
+        return None, "Upload an image first."
+    if STATE["mask_np"] is None:
+        return None, "Create a mask by clicking the image."
+
+    image = STATE["working_pil"]
+    mask_np = postprocess_mask(STATE["mask_np"], int(expand_px), int(blur_px))
+    STATE["mask_np"] = mask_np
+    mask_pil = mask_to_pil(mask_np)
+
+    if MOCK_INPAINT:
+        # 모델 없이 UI/합성 파이프 테스트용
+        preview = overlay_mask_on_image(image, mask_np)
+        return preview, "MOCK mode: returned mask overlay preview."
+
+    # Safety: 빈 프롬프트면 실행 가치가 낮아서 early return
+    if prompt is None or prompt.strip() == "":
+        return None, "Prompt is empty."
+
     result = pipe(
         prompt=prompt,
-        image=img.convert("RGB"),
-        mask_image=current_mask,
-        num_inference_steps=30,  # 30단계면 충분히 고퀄리티가 나옵니다.
-        strength=0.85,           # 원본과의 조화 정도 (0.7~0.9 권장)
-        guidance_scale=7.5
+        negative_prompt=negative_prompt,
+        image=image,
+        mask_image=mask_pil,
+        num_inference_steps=int(steps),
+        strength=float(strength),
+        guidance_scale=float(guidance_scale),
     ).images[0]
-    
-    return result, "생성이 완료되었습니다!"
 
-# 3. UI 구성
-with gr.Blocks(title="3080 Ti AI Photo Editor") as demo:
-    gr.Markdown("## ⚡ 3080 Ti 가속 AI 이미지 편집기")
-    
+    return result, "Done."
+
+def clear_mask():
+    """마스크만 초기화."""
+    STATE["mask_np"] = None
+    return None, "Mask cleared."
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+with gr.Blocks(title="Local Image Edit (Fast + vit_b/vit_h)") as demo:
+    gr.Markdown(
+        "# Local Image Edit (SAM + SDXL Inpaint)\n"
+        "- SAM: vit_b / vit_h 선택 가능\n"
+        "- set_image 캐시로 클릭 반복 시 속도 개선\n"
+        "- working 해상도 고정으로 좌표 꼬임/늘어짐 감소\n"
+        "- GPU 없는 환경은 MOCK_INPAINT=1로 UI 테스트 가능\n"
+    )
+
     with gr.Row():
-        with gr.Column():
-            input_img = gr.Image(label="1. 원본 업로드", type="pil")
-            mask_preview = gr.Image(label="2. 클릭하여 영역 지정 (빨간색)")
-            status_text = gr.Textbox(label="상태 알림", interactive=False)
-            
-        with gr.Column():
-            prompt_input = gr.Textbox(label="3. 변경할 내용 입력", placeholder="예: a fancy long sleeve black sweater")
-            run_button = gr.Button("✨ 변환 실행 (Apply)", variant="primary")
-            output_img = gr.Image(label="4. 결과물")
+        with gr.Column(scale=1):
+            input_img = gr.Image(label="Upload", type="pil")
+            status = gr.Textbox(label="Status", interactive=False)
 
-    # 이벤트 바인딩
-    input_img.select(on_select, inputs=[input_img], outputs=[mask_preview, status_text])
-    run_button.click(run_inpaint, inputs=[input_img, prompt_input], outputs=[output_img, status_text])
+            # 작업 해상도(긴 변). 기본 1024.
+            work_long_side = gr.Slider(512, 1536, value=1024, step=64, label="Working Long Side")
+
+            # SAM 모델 선택
+            sam_model_type = gr.Dropdown(
+                choices=["vit_b", "vit_h"],
+                value="vit_b",
+                label="SAM Model (speed vs accuracy)"
+            )
+
+            # 마스크 후처리
+            expand_px = gr.Slider(0, 40, value=12, step=1, label="Mask Expand(px)")
+            blur_px = gr.Slider(0, 40, value=8, step=1, label="Mask Blur(px)")
+
+            # 프롬프트
+            prompt = gr.Textbox(
+                label="Prompt",
+                placeholder="e.g. short-sleeve shirt, natural arm, realistic fabric, photorealistic"
+            )
+            negative_prompt = gr.Textbox(
+                label="Negative Prompt",
+                value="blurry, distorted, bad anatomy, extra limbs, deformed, low quality"
+            )
+
+            # 생성 파라미터 (속도/품질 트레이드오프)
+            steps = gr.Slider(10, 60, value=28, step=1, label="Steps")
+            strength = gr.Slider(0.3, 0.95, value=0.78, step=0.01, label="Strength")
+            guidance_scale = gr.Slider(1.0, 12.0, value=6.0, step=0.1, label="Guidance Scale")
+
+            with gr.Row():
+                btn_apply = gr.Button("Apply", variant="primary")
+                btn_clear = gr.Button("Clear Mask")
+
+        with gr.Column(scale=1):
+            working_view = gr.Image(label="Working Image (click here)", interactive=True)
+            mask_preview = gr.Image(label="Mask Preview")
+            output_img = gr.Image(label="Result")
+
+    # 업로드 -> working 이미지 생성 후 working_view에 표시
+    input_img.change(
+        fn=on_upload,
+        inputs=[input_img, work_long_side],
+        outputs=[working_view, output_img, status],
+    )
+
+    # working_view에서 클릭 -> 마스크 생성
+    working_view.select(
+        fn=on_click,
+        inputs=[sam_model_type, expand_px, blur_px],
+        outputs=[mask_preview, status],
+    )
+
+    # apply
+    btn_apply.click(
+        fn=apply_edit,
+        inputs=[sam_model_type, prompt, negative_prompt, steps, strength, guidance_scale, expand_px, blur_px],
+        outputs=[output_img, status],
+    )
+
+    # clear mask
+    btn_clear.click(fn=clear_mask, inputs=[], outputs=[mask_preview, status])
 
 if __name__ == "__main__":
-    # share=True로 하면 외부에서도 접속 가능한 주소가 나옵니다.
-    demo.launch()
+    demo.launch(share=True)
