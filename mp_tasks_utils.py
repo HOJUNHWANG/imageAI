@@ -249,6 +249,20 @@ def build_sleeve_mask_v5_tasks(image_pil: Image.Image, helper: MPTasksHelper) ->
 
     lm = helper.pose_landmarks(image_pil)
 
+    # 기존 arm_band 위에 추가
+    for (sx, sy) in [ls, rs]:
+        # shoulder-centered ellipse
+        cv2.ellipse(
+            arm_band,
+            center=(sx, sy),
+            axes=(int(arm_th * 1.2), int(arm_th * 0.9)),
+            angle=0,
+            startAngle=0,
+            endAngle=360,
+            color=255,
+            thickness=-1,
+        )
+
     # Upper arm band (pose-guided)
     arm_band = np.zeros((h, w), dtype=np.uint8)
     if lm is not None:

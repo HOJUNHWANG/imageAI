@@ -316,7 +316,7 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
 
     info = parse_prompt_simple(prompt)
     target = info["target"]
-    
+
     # --- v5: MediaPipe Tasks candidates (PoseLandmarker + ImageSegmenter) -----
     if mp_tasks is not None and STATE["working_pil"] is not None:
         if target == "sleeve":
