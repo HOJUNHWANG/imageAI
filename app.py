@@ -4,6 +4,8 @@ import gradio as gr
 import torch
 from PIL import Image
 import re
+from human_parsing import HumanParsing
+from mediapipe_utils import MPHelper, build_sleeve_mask_v5, build_top_mask_v5
 
 
 from sam_utils import SamMaskerManager
@@ -85,6 +87,15 @@ print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}, MODEL_ID={MODEL_ID}")
 # -----------------------------------------------------------------------------
 # Prompt parsing + scoring (v4)
 # -----------------------------------------------------------------------------
+
+parsing = HumanParsing(device=DEVICE)
+
+mp_helper = None
+try:
+    mp_helper = MPHelper()
+except Exception:
+    mp_helper = None
+
 
 COLOR_KEYWORDS = {
     "black": ["검정", "검은", "블랙", "black"],
@@ -293,6 +304,46 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
     if STATE["working_np"] is None:
         return [], "Upload an image first."
 
+    # --- v5: semantic parsing -----------------------------------------
+    info = parse_prompt_simple(prompt)  # (이 함수는 이전에 추가한 버전 기준)
+    target = info["target"]
+
+    # --- v5: MediaPipe semantic-ish candidates (no external weights) ----------
+    # This path is designed to work on CPU laptops as well.
+    if mp_helper is not None and STATE["working_pil"] is not None:
+        if target == "sleeve":
+            c = build_sleeve_mask_v5(STATE["working_pil"], mp_helper)
+            STATE["auto_mask_candidates"] = [c]
+            return [c], f"v5(mp) sleeve candidate built. candidates=1"
+        if target == "top":
+            c = build_top_mask_v5(STATE["working_pil"], mp_helper)
+            STATE["auto_mask_candidates"] = [c]
+            return [c], f"v5(mp) top candidate built. candidates=1"
+
+    # If human parsing is enabled and returns a usable person mask,
+    # try generating a semantic candidate before SAM proposals.
+    if parsing.enabled and STATE["working_pil"] is not None:
+        masks = parsing.predict(STATE["working_pil"])
+
+        # If we only have "person", we can still create a torso candidate
+        # by cropping the person region to a torso ROI (works surprisingly well).
+        if "person" in masks:
+            person = masks["person"]
+            h, w = person.shape[:2]
+
+            # torso ROI heuristic (below head, above hips)
+            torso = np.zeros_like(person, dtype=np.uint8)
+            y0 = int(0.28 * h)
+            y1 = int(0.85 * h)
+            x0 = int(0.18 * w)
+            x1 = int(0.82 * w)
+            torso[y0:y1, x0:x1] = person[y0:y1, x0:x1]
+
+            # Candidate 1: torso-based mask (best effort)
+            candidates = [torso]
+            STATE["auto_mask_candidates"] = candidates
+            return candidates, f"v5 semantic candidate: target={target}, color={info['color']}, garment={info['garment']}, candidates=1"
+        
     img_np = STATE["working_np"]
     h, w = img_np.shape[:2]
 

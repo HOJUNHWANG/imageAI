@@ -8,4 +8,8 @@ opencv-python
 pillow
 numpy
 segment-anything
+torchvision
+timm
+torchvision
+mediapipe
 # xformers (GPU optional)
