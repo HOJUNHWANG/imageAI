@@ -169,7 +169,6 @@ auto_enrich = gr.Checkbox(
 
 expanded_preview = gr.Textbox(label="Expanded Prompt Preview (read-only)", interactive=False)
 
-
 # -----------------------------------------------------------------------------
 # Model loaders
 # -----------------------------------------------------------------------------
@@ -503,10 +502,19 @@ with gr.Blocks(title=APP_TITLE, theme=theme, css=CSS) as demo:
                     mask_expand = gr.Slider(label="Mask Expand (px)", minimum=0, maximum=40, step=1, value=18)
                     mask_blur = gr.Slider(label="Mask Blur (px)", minimum=0, maximum=40, step=1, value=10)
 
+                    auto_enrich = gr.Checkbox(
+                        label="Auto-enrich prompt (natural language → diffusion tokens)",
+                        value=True,
+                        interactive=True
+                    )
+
                     prompt = gr.Textbox(
                         label="Prompt (Korean/English)",
                         value="black tank top, sleeveless, natural shoulders and arms, realistic skin texture, realistic fabric, photorealistic"
                     )
+
+                    expanded_preview = gr.Textbox(label="Expanded Prompt Preview (read-only)", interactive=False)
+
                     negative = gr.Textbox(
                         label="Negative Prompt",
                         value="bad anatomy, extra arms, extra hands, deformed, blurry, artifacts, low quality"
@@ -538,9 +546,9 @@ with gr.Blocks(title=APP_TITLE, theme=theme, css=CSS) as demo:
             outputs=[auto_gallery, auto_status, expanded_preview],
         )
 
-        auto_gallery.select(select_candidate, inputs=None, outputs=[mask_overlay, auto_status])
+        auto_gallery.select(select_candidate, inputs=[], outputs=[mask_overlay, auto_status])
 
-        btn_clear.click(clear_mask, inputs=None, outputs=[mask_overlay, selected_mask_preview, auto_gallery, auto_status])
+        btn_clear.click(clear_mask, inputs=[], outputs=[mask_overlay, selected_mask_preview, auto_gallery, auto_status])
 
         btn_apply.click(
             apply_inpaint,
