@@ -2,30 +2,38 @@ import numpy as np
 import torch
 from segment_anything import sam_model_registry, SamPredictor
 
-# 자바의 Helper Class 같은 역할입니다.
 class AutoMasker:
     def __init__(self, checkpoint_path, model_type="vit_h", device="cuda"):
-        # 모델 로드 (생성자에서 한 번만 로드)
+        # GPU 사용 가능 여부 재확인
+        actual_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"SAM 로딩 중... 장치: {actual_device}")
+        
         sam = sam_model_registry[model_type](checkpoint=checkpoint_path)
-        sam.to(device=device)
+        sam.to(device=actual_device)
         self.predictor = SamPredictor(sam)
+        self.current_image_hash = None # 이미지 변경 감지용
+
+    def set_image(self, image_np):
+        # 이미지가 바뀌었을 때만 임베딩을 새로 계산합니다 (속도 향상의 핵심)
+        image_hash = hash(image_np.tostring())
+        if self.current_image_hash != image_hash:
+            self.predictor.set_image(image_np)
+            self.current_image_hash = image_hash
+            print("이미지 임베딩 완료 (새로운 이미지)")
 
     def generate_mask(self, image_np, x, y):
-        # 1. 원본 이미지 설정 (numpy 배열 형태)
-        self.predictor.set_image(image_np)
+        # 1. 이미지 설정 (바뀌었을 때만 동작)
+        self.set_image(image_np)
 
-        # 2. 클릭한 좌표를 바탕으로 마스크 예측
-        # input_point: [x, y] 좌표 / input_label: 1은 해당 물체를 포함하라는 의미
+        # 2. 마스크 예측 (이 부분은 GPU에서 순식간에 끝납니다)
         input_point = np.array([[x, y]])
         input_label = np.array([1])
 
-        # masks: 결과 마스크 리스트 / scores: 예측 정확도 점수
         masks, scores, logits = self.predictor.predict(
             point_coords=input_point,
             point_labels=input_label,
-            multimask_output=False, # 가장 정확한 마스크 하나만 가져옴
+            multimask_output=False,
         )
         
-        # 0과 1로 된 마스크를 0(검정)과 255(흰색)의 이미지 데이터로 변환
         mask_image = (masks[0] * 255).astype(np.uint8)
         return mask_image
