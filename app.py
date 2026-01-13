@@ -5,7 +5,7 @@ import torch
 from PIL import Image
 import re
 from human_parsing import HumanParsing
-from mediapipe_utils import MPHelper, build_sleeve_mask_v5, build_top_mask_v5
+from mp_tasks_utils import MPTasksHelper, build_sleeve_mask_v5_tasks, build_top_mask_v5_tasks
 
 
 from sam_utils import SamMaskerManager
@@ -88,21 +88,23 @@ print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}, MODEL_ID={MODEL_ID}")
 # Prompt parsing + scoring (v4)
 # -----------------------------------------------------------------------------
 
-mp_helper = None
-MP_INIT_ERROR = None
+mp_tasks = None
+MP_TASKS_INIT_ERROR = None
 
 try:
-    mp_helper = MPHelper()
+    mp_tasks = MPTasksHelper(weights_dir="weights")
+    if not mp_tasks.enabled:
+        MP_TASKS_INIT_ERROR = f"MPTasks disabled ({mp_tasks.diag}). Ensure model files exist under ./weights"
+        mp_tasks = None
 except Exception as e:
-    mp_helper = None
-    MP_INIT_ERROR = repr(e)
+    mp_tasks = None
+    MP_TASKS_INIT_ERROR = repr(e)
 
-print(f"[BOOT] mp_helper={'OK' if mp_helper else 'NONE'}")
-if MP_INIT_ERROR:
-    print(f"[BOOT] MP_INIT_ERROR={MP_INIT_ERROR}")
+print(f"[BOOT] mp_tasks={'OK' if mp_tasks else 'NONE'}")
+if MP_TASKS_INIT_ERROR:
+    print(f"[BOOT] MP_TASKS_INIT_ERROR={MP_TASKS_INIT_ERROR}")
 
 parsing = HumanParsing(device=DEVICE)
-
 
 
 COLOR_KEYWORDS = {
@@ -317,16 +319,16 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
 
     print(f"[AUTO] target={target}, mp_helper={'OK' if mp_helper else 'NONE'}, working_pil={'OK' if STATE['working_pil'] else 'NONE'}")
 
-    # --- v5: MediaPipe semantic-ish candidates (no external weights) ----------
-    if mp_helper is not None and STATE["working_pil"] is not None:
+    # --- v5: MediaPipe Tasks candidates (PoseLandmarker + ImageSegmenter) -----
+    if mp_tasks is not None and STATE["working_pil"] is not None:
         if target == "sleeve":
-            c = build_sleeve_mask_v5(STATE["working_pil"], mp_helper)
+            c = build_sleeve_mask_v5_tasks(STATE["working_pil"], mp_tasks)
             STATE["auto_mask_candidates"] = [c]
-            return [c], f"v5(mp) sleeve candidate built. candidates=1"
+            return [c], f"v5(mp-tasks) sleeve candidate built. candidates=1"
         if target == "top":
-            c = build_top_mask_v5(STATE["working_pil"], mp_helper)
+            c = build_top_mask_v5_tasks(STATE["working_pil"], mp_tasks)
             STATE["auto_mask_candidates"] = [c]
-            return [c], f"v5(mp) top candidate built. candidates=1"
+            return [c], f"v5(mp-tasks) top candidate built. candidates=1"
 
     # --- optional: parsing backend (currently likely disabled) ----------------
     if parsing.enabled and STATE["working_pil"] is not None:
