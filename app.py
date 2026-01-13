@@ -88,13 +88,21 @@ print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}, MODEL_ID={MODEL_ID}")
 # Prompt parsing + scoring (v4)
 # -----------------------------------------------------------------------------
 
-parsing = HumanParsing(device=DEVICE)
-
 mp_helper = None
+MP_INIT_ERROR = None
+
 try:
     mp_helper = MPHelper()
-except Exception:
+except Exception as e:
     mp_helper = None
+    MP_INIT_ERROR = repr(e)
+
+print(f"[BOOT] mp_helper={'OK' if mp_helper else 'NONE'}")
+if MP_INIT_ERROR:
+    print(f"[BOOT] MP_INIT_ERROR={MP_INIT_ERROR}")
+
+parsing = HumanParsing(device=DEVICE)
+
 
 
 COLOR_KEYWORDS = {
@@ -304,12 +312,12 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
     if STATE["working_np"] is None:
         return [], "Upload an image first."
 
-    # --- v5: semantic parsing -----------------------------------------
-    info = parse_prompt_simple(prompt)  # (이 함수는 이전에 추가한 버전 기준)
+    info = parse_prompt_simple(prompt)
     target = info["target"]
 
+    print(f"[AUTO] target={target}, mp_helper={'OK' if mp_helper else 'NONE'}, working_pil={'OK' if STATE['working_pil'] else 'NONE'}")
+
     # --- v5: MediaPipe semantic-ish candidates (no external weights) ----------
-    # This path is designed to work on CPU laptops as well.
     if mp_helper is not None and STATE["working_pil"] is not None:
         if target == "sleeve":
             c = build_sleeve_mask_v5(STATE["working_pil"], mp_helper)
@@ -320,35 +328,23 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
             STATE["auto_mask_candidates"] = [c]
             return [c], f"v5(mp) top candidate built. candidates=1"
 
-    # If human parsing is enabled and returns a usable person mask,
-    # try generating a semantic candidate before SAM proposals.
+    # --- optional: parsing backend (currently likely disabled) ----------------
     if parsing.enabled and STATE["working_pil"] is not None:
         masks = parsing.predict(STATE["working_pil"])
-
-        # If we only have "person", we can still create a torso candidate
-        # by cropping the person region to a torso ROI (works surprisingly well).
         if "person" in masks:
             person = masks["person"]
             h, w = person.shape[:2]
-
-            # torso ROI heuristic (below head, above hips)
             torso = np.zeros_like(person, dtype=np.uint8)
-            y0 = int(0.28 * h)
-            y1 = int(0.85 * h)
-            x0 = int(0.18 * w)
-            x1 = int(0.82 * w)
+            y0, y1 = int(0.28 * h), int(0.85 * h)
+            x0, x1 = int(0.18 * w), int(0.82 * w)
             torso[y0:y1, x0:x1] = person[y0:y1, x0:x1]
 
-            # Candidate 1: torso-based mask (best effort)
-            candidates = [torso]
-            STATE["auto_mask_candidates"] = candidates
-            return candidates, f"v5 semantic candidate: target={target}, color={info['color']}, garment={info['garment']}, candidates=1"
-        
+            STATE["auto_mask_candidates"] = [torso]
+            return [torso], f"v5(parsing) torso candidate built. candidates=1"
+
+    # --- v4 fallback: SAM proposals ------------------------------------------
     img_np = STATE["working_np"]
     h, w = img_np.shape[:2]
-
-    info = parse_prompt_simple(prompt)
-    target = info["target"]
 
     masker = sam_manager.get(sam_model_type)
     masks = masker.auto_masks(img_np)
@@ -357,13 +353,11 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
 
     if target == "sleeve":
         left_m, right_m = pick_left_right_sleeve_masks(masks, w, h)
-
         union = None
         if left_m is not None:
             union = union_masks(union, sam_dict_to_uint8_mask(left_m))
         if right_m is not None:
             union = union_masks(union, sam_dict_to_uint8_mask(right_m))
-
         if union is not None:
             candidates.append(union)
 
@@ -379,18 +373,19 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
                 break
             candidates.append(sam_dict_to_uint8_mask(m))
 
-        uniq = []
-        seen = set()
+        # De-dup
+        uniq, seen = [], set()
         for c in candidates:
             key = int(c.sum())
             if key not in seen:
                 uniq.append(c)
                 seen.add(key)
+
         candidates = uniq[:top_k]
-
         STATE["auto_mask_candidates"] = candidates
-        return candidates, f"Auto masks v4 target={target}, color={info['color']}, garment={info['garment']}, candidates={len(candidates)}"
+        return candidates, f"Auto masks v4 (mp=OFF) target={target}, color={info['color']}, garment={info['garment']}, candidates={len(candidates)}"
 
+    # non-sleeve targets
     scored = []
     for m in masks:
         s = score_mask_v4(target, m, w, h)
@@ -402,7 +397,7 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
         candidates.append(sam_dict_to_uint8_mask(m))
 
     STATE["auto_mask_candidates"] = candidates
-    return candidates, f"Auto masks v4 target={target}, candidates={len(candidates)}"
+    return candidates, f"Auto masks v4 (mp=OFF) target={target}, candidates={len(candidates)}"
 
 # -----------------------------------------------------------------------------
 # UI handlers
