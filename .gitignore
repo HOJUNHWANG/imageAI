@@ -1,12 +1,41 @@
-# 가상환경
-ai_env/
-venv/
+# --- Python ---
 __pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dll
+*.dylib
+*.egg-info/
+dist/
+build/
 
-# 대용량 모델 가중치
-weights/*.pth
+# --- Virtual env ---
+.venv/
+venv/
+venv311/
+env/
+ENV/
 
-# 결과물 및 임시 파일
+# --- OS / IDE ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Model weights / artifacts ---
+weights/
+*.pth
+*.safetensors
+*.ckpt
+*.onnx
+
+# --- Outputs ---
 outputs/
 *.png
 *.jpg
+*.jpeg
+*.webp
+*.mp4
+
+# --- Logs ---
+*.log
