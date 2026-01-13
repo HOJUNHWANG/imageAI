@@ -161,7 +161,12 @@ def parse_prompt_simple(prompt: str) -> dict:
 
     return {"target": target, "color": color or "n/a", "garment": garment or "n/a"}
 
-auto_enrich = gr.Checkbox(label="Auto-enrich prompt (natural language → diffusion tokens)", value=True)
+auto_enrich = gr.Checkbox(
+    label="Auto-enrich prompt (natural language → diffusion tokens)",
+    value=True,
+    interactive=True
+)
+
 expanded_preview = gr.Textbox(label="Expanded Prompt Preview (read-only)", interactive=False)
 
 
@@ -225,6 +230,13 @@ sam_manager = SamMaskerManager(weights_dir=WEIGHTS_DIR, device=DEVICE if DEVICE 
 # Gradio callbacks
 # -----------------------------------------------------------------------------
 
+def debug_ping(user_prompt: str, auto_enrich_flag: bool):
+    print("[PING] Auto button callback fired")
+    print("[PING] prompt head:", (user_prompt or "")[:120])
+    print("[PING] auto_enrich_flag:", auto_enrich_flag)
+    print("[PING] working_np:", None if STATE["working_np"] is None else STATE["working_np"].shape)
+    return [], "PING OK (callback fired)", user_prompt
+
 def on_upload(img: Image.Image, working_long_side: int):
     if img is None:
         return None, None, "Upload an image first."
@@ -259,18 +271,41 @@ def on_manual_click(evt: gr.SelectData, sam_model_type: str):
     vis = overlay_mask(STATE["working_np"], mask_u8)
     return Image.fromarray(vis), Image.fromarray(mask_u8), f"Manual mask built (SAM {sam_model_type})."
 
-def build_auto_candidates_v5(user_prompt: str, auto_enrich_flag: bool):
+import traceback
+import time
+
+def build_auto_candidates_v5(user_prompt: str, auto_enrich_flag: bool | None):
+    auto_enrich_flag = bool(auto_enrich_flag)  # None -> False 로 강제
+    t0 = time.time()
     try:
+        print("\n[AUTO] called")
+        print("[AUTO] prompt head:", (user_prompt or "")[:160])
+        print("[AUTO] auto_enrich:", auto_enrich_flag)
+
         if STATE["working_pil"] is None or STATE["working_np"] is None:
+            print("[AUTO] no image in STATE")
             return [], "Upload an image first.", ""
 
-        # Prompt enrichment (deterministic, debuggable)
-        expanded, info = enrich_positive(user_prompt)
-        target = info.target
+        print("[AUTO] working_pil size:", STATE["working_pil"].size)
+        print("[AUTO] working_np shape:", STATE["working_np"].shape)
+
+        # Prompt enrichment
+        expanded = user_prompt
+        if auto_enrich_flag:
+            expanded, info = enrich_positive(user_prompt)
+            target = info.target
+        else:
+            info = parse_prompt_simple(user_prompt)
+            target = info["target"]
+
+        print("[AUTO] target:", target)
+        print("[AUTO] expanded head:", (expanded or "")[:160])
 
         if mp_helper is None:
-            return [], f"mp_helper unavailable. error={MP_INIT_ERROR}", expanded
+            print("[AUTO] mp_helper NONE:", MP_INIT_ERROR)
+            return [], f"mp_helper unavailable: {MP_INIT_ERROR}", expanded
 
+        # Build mask
         if target == "sleeve":
             c = build_sleeve_mask_v5_tasks(STATE["working_pil"], mp_helper)
         elif target == "top":
@@ -284,14 +319,18 @@ def build_auto_candidates_v5(user_prompt: str, auto_enrich_flag: bool):
         else:
             c = build_top_mask_v5_tasks(STATE["working_pil"], mp_helper)
 
+        print("[AUTO] mask dtype/shape:", c.dtype, c.shape, "unique:", np.unique(c)[:10])
+
         STATE["auto_mask_candidates"] = [c]
-        status = f"v5(mp-tasks) target={target}, candidates=1, color={info.color or 'n/a'}, garment={info.garment or 'n/a'}"
-        return [Image.fromarray(c)], status, expanded
-    
+        dt = time.time() - t0
+        return [Image.fromarray(c)], f"v5(mp-tasks) OK target={target} time={dt:.2f}s", expanded
+
     except Exception:
         tb = traceback.format_exc()
         print(tb)
+        # Status에 traceback을 넣어 UI에서 바로 보이게 함
         return [], tb, ""
+
 
 def select_candidate(evt: gr.SelectData):
     """
@@ -325,9 +364,10 @@ def apply_inpaint(
     expand_px: int,
     blur_px: int,
     seed: int,
-    auto_enrich_flag: bool,
-    
-):
+    auto_enrich_flag: bool, ):
+
+    auto_enrich_flag = bool(auto_enrich_flag)
+
     if STATE["working_pil"] is None or STATE["working_np"] is None:
         return None, "Upload an image first."
 
@@ -492,7 +532,11 @@ with gr.Blocks(title=APP_TITLE, theme=theme, css=CSS) as demo:
 
         input_image.select(on_manual_click, inputs=[sam_model], outputs=[mask_overlay, selected_mask_preview, auto_status])
 
-        btn_auto.click(build_auto_candidates_v5, inputs=[prompt, auto_enrich], outputs=[auto_gallery, auto_status, expanded_preview])
+        btn_auto.click(
+            fn=build_auto_candidates_v5,
+            inputs=[prompt, auto_enrich],
+            outputs=[auto_gallery, auto_status, expanded_preview],
+        )
 
         auto_gallery.select(select_candidate, inputs=None, outputs=[mask_overlay, auto_status])
 
@@ -503,6 +547,7 @@ with gr.Blocks(title=APP_TITLE, theme=theme, css=CSS) as demo:
             inputs=[prompt, negative, steps, strength, guidance, mask_expand, mask_blur, seed, auto_enrich],
             outputs=[output, run_status]
         )
+
 
 
 if __name__ == "__main__":
