@@ -3,6 +3,8 @@ import numpy as np
 import gradio as gr
 import torch
 from PIL import Image
+import re
+
 
 from sam_utils import SamMaskerManager
 from image_utils import (
@@ -83,14 +85,94 @@ print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}, MODEL_ID={MODEL_ID}")
 # -----------------------------------------------------------------------------
 # Prompt parsing + scoring (v4)
 # -----------------------------------------------------------------------------
-def infer_edit_target(prompt: str) -> str:
+
+COLOR_KEYWORDS = {
+    "black": ["검정", "검은", "블랙", "black"],
+    "white": ["흰", "화이트", "white"],
+    "gray":  ["회색", "그레이", "gray", "grey"],
+    "red":   ["빨강", "레드", "red"],
+    "blue":  ["파랑", "블루", "blue"],
+    "green": ["초록", "그린", "green"],
+    "navy":  ["네이비", "navy"],
+    "beige": ["베이지", "beige"],
+    "brown": ["갈색", "브라운", "brown"],
+    "pink":  ["분홍", "핑크", "pink"],
+    "purple":["보라", "퍼플", "purple"],
+}
+
+GARMENT_KEYWORDS = {
+    "tank_top": ["민소매", "나시", "sleeveless", "tank", "tank top"],
+    "tshirt":   ["티셔츠", "티", "t-shirt", "tee", "tshirt"],
+    "shirt":    ["셔츠", "shirt", "dress shirt", "button up", "button-up"],
+    "hoodie":   ["후드", "후드티", "hoodie"],
+    "sweater":  ["니트", "스웨터", "sweater", "knit"],
+    "jacket":   ["자켓", "재킷", "jacket"],
+    "blazer":   ["블레이저", "정장", "blazer", "suit"],
+}
+
+def extract_first_match(prompt: str, mapping: dict) -> str | None:
     p = (prompt or "").lower()
+    for key, words in mapping.items():
+        if any(w.lower() in p for w in words):
+            return key
+    return None
 
-    sleeve_keywords = ["긴팔", "반팔", "소매", "sleeve", "short sleeve", "long sleeve"]
-    top_keywords = ["상의", "셔츠", "자켓", "재킷", "후드", "hoodie", "shirt", "jacket", "top"]
-    pants_keywords = ["바지", "하의", "pants", "trousers", "jeans"]
-    dress_keywords = ["드레스", "치마", "skirt", "dress"]
+def parse_prompt_simple(prompt: str) -> dict:
+    """
+    Minimal prompt parser.
 
+    - Extract garment/color hints for logging/presets.
+    - Keeps structure extensible for future (human parsing, grounded masks, etc).
+    """
+    return {
+        "target": infer_edit_target(prompt),
+        "color": extract_first_match(prompt, COLOR_KEYWORDS),
+        "garment": extract_first_match(prompt, GARMENT_KEYWORDS),
+        "raw": prompt or "",
+    }
+
+def infer_edit_target(prompt: str) -> str:
+    """
+    Rule-based intent classifier.
+
+    - Keyword list is intentionally large to support casual sentence prompts.
+    - Matching order matters: sleeve first (often overlaps with top), then top, pants, dress, generic.
+    """
+    p = (prompt or "").lower().strip()
+
+    # Sleeve-focused edits (often implies top + arms)
+    sleeve_keywords = [
+        "긴팔", "반팔", "소매", "소매를", "팔부분", "팔 부분", "팔을", "팔만",
+        "나시", "민소매",  # sleeveless implies sleeve edit
+        "sleeve", "sleeves", "short sleeve", "long sleeve",
+        "sleeveless", "tank", "tank top",
+        "cap sleeve", "rolled sleeve", "roll up", "roll-up",
+        "remove sleeves", "cut sleeves", "cut-off", "cutoff",
+    ]
+
+    # Top / upper-body clothing
+    top_keywords = [
+        "상의", "상체", "윗옷", "티", "티셔츠", "반팔티", "긴팔티", "셔츠", "블라우스",
+        "후드", "후드티", "집업", "가디건", "니트", "스웨터", "맨투맨",
+        "자켓", "재킷", "재킷을", "코트", "점퍼", "패딩", "바람막이",
+        "조끼", "베스트", "vest",
+        "정장", "수트", "블레이저", "blazer", "suit",
+        "shirt", "t-shirt", "tee", "top", "upper", "hoodie", "sweater", "jacket", "coat", "cardigan"
+    ]
+
+    # Bottom / pants
+    pants_keywords = [
+        "바지", "하의", "팬츠", "청바지", "슬랙스", "레깅스", "반바지", "쇼츠",
+        "pants", "trousers", "jeans", "slacks", "shorts", "leggings"
+    ]
+
+    # Dress / skirt
+    dress_keywords = [
+        "드레스", "원피스", "치마", "스커트",
+        "dress", "skirt"
+    ]
+
+    # Order matters
     if any(k in p for k in sleeve_keywords):
         return "sleeve"
     if any(k in p for k in top_keywords):
@@ -125,6 +207,16 @@ def score_mask_v4(target: str, mask_dict: dict, img_w: int, img_h: int) -> float
     center = clamp01(1.0 - abs(nx - 0.50) / 0.50)
 
     seg_bool = mask_dict["segmentation"]
+
+    # --- Top-specific ROIs (to avoid face/head candidates) -------------------
+    # Torso ROI: upper-body region where shirts usually exist (below head, above hips).
+    torso_roi = roi_mask(img_h, img_w, 0.18, 0.28, 0.82, 0.85)
+    torso_overlap = overlap_ratio(seg_bool, torso_roi)
+
+    # Head ROI: if a mask heavily covers the head, it's not a "top" candidate.
+    head_roi_strict = roi_mask(img_h, img_w, 0.12, 0.00, 0.88, 0.26)
+    head_leak_strict = float((seg_bool & head_roi_strict).sum()) / (float(seg_bool.sum()) + 1e-6)
+
     human_roi = roi_mask(img_h, img_w, 0.20, 0.18, 0.80, 0.95)
     human_overlap = overlap_ratio(seg_bool, human_roi)
     if human_overlap < 0.30:
@@ -145,7 +237,21 @@ def score_mask_v4(target: str, mask_dict: dict, img_w: int, img_h: int) -> float
         return (0.30 * upper) + (0.35 * arm_score) + (0.20 * area_score) + (0.15 * head_penalty)
 
     if target == "top":
-        return (0.35 * upper) + (0.30 * center) + (0.20 * area_score) + (0.15 * head_penalty)
+    # Require torso overlap; otherwise candidates are often face/hair/ears.
+        if torso_overlap < 0.35:
+            return 0.0
+
+    # Hard cut: if the mask is mostly head, reject for top edits.
+        if head_leak_strict > 0.08:
+            return 0.0
+
+        return (
+            0.45 * upper +
+            0.20 * center +
+            0.20 * area_score +
+            0.15 * head_penalty
+        )
+
 
     if target == "pants":
         return (0.45 * lower) + (0.20 * center) + (0.20 * area_score) + (0.15 * head_penalty)
@@ -190,7 +296,8 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
     img_np = STATE["working_np"]
     h, w = img_np.shape[:2]
 
-    target = infer_edit_target(prompt)
+    info = parse_prompt_simple(prompt)
+    target = info["target"]
 
     masker = sam_manager.get(sam_model_type)
     masks = masker.auto_masks(img_np)
@@ -231,7 +338,7 @@ def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
         candidates = uniq[:top_k]
 
         STATE["auto_mask_candidates"] = candidates
-        return candidates, f"Auto masks v4 (sleeve). candidates={len(candidates)}"
+        return candidates, f"Auto masks v4 target={target}, color={info['color']}, garment={info['garment']}, candidates={len(candidates)}"
 
     scored = []
     for m in masks:
