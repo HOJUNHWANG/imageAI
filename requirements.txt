@@ -1,5 +1,6 @@
 gradio>=4.0.0
 torch
+torchvision
 diffusers>=0.30.0
 transformers
 accelerate
@@ -7,3 +8,4 @@ opencv-python
 pillow
 numpy
 segment-anything
+# xformers (GPU optional)

@@ -1,11 +1,5 @@
 ******************************************************************************************************
 
-
- xformers is optional but can be receommended on GPU environment
- 
-
-******************************************************************************************************
-
 Using Local GPU (Recommended)
 
     pip install -r requirements.txt
@@ -14,10 +8,12 @@ Using Local GPU (Recommended)
 
 ******************************************************************************************************
 
+
 Using Local CPU
 
     pip install -r requirements.txt
-    set MOCK_INPAINT=1
+    $env:MOCK_INPAINT="1"
     python app.py
+
 
 ******************************************************************************************************

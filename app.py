@@ -4,8 +4,6 @@ import gradio as gr
 import torch
 from PIL import Image
 
-from diffusers import AutoPipelineForInpainting
-
 from sam_utils import SamMaskerManager
 from image_utils import (
     to_rgb_pil,
@@ -16,6 +14,9 @@ from image_utils import (
     sam_dict_to_uint8_mask,
     bbox_center,
     clamp01,
+    roi_mask,
+    overlap_ratio,
+    union_masks,
 )
 
 # -----------------------------------------------------------------------------
@@ -40,21 +41,24 @@ STATE = {
     "working_pil": None,
     "working_np": None,
     "mask_np": None,
-    "auto_mask_candidates": [],  # list of uint8 masks
+    "auto_mask_candidates": [],
 }
 
 # -----------------------------------------------------------------------------
-# SAM manager (vit_b/vit_h)
+# SAM manager
 # -----------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(__file__)
 WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
 sam_manager = SamMaskerManager(weights_dir=WEIGHTS_DIR, device=DEVICE)
 
 # -----------------------------------------------------------------------------
-# Inpaint pipeline
+# Inpaint pipeline (IMPORTANT: conditional import to avoid diffusers/xformers crash in MOCK mode)
 # -----------------------------------------------------------------------------
 pipe = None
 if not MOCK_INPAINT:
+    # diffusers는 여기서만 import
+    from diffusers import AutoPipelineForInpainting
+
     dtype = torch.float16 if DEVICE == "cuda" else torch.float32
     variant = "fp16" if DEVICE == "cuda" else None
 
@@ -65,33 +69,22 @@ if not MOCK_INPAINT:
         use_safetensors=True,
     ).to(DEVICE)
 
+    # xformers는 있으면 활성화, 없거나 깨져 있으면 무시
     if DEVICE == "cuda":
         try:
             pipe.enable_xformers_memory_efficient_attention()
-            print("[OK] xformers enabled")
-        except Exception as e:
-            print("[WARN] xformers not available:", e)
+        except Exception:
+            pass
 
     pipe.set_progress_bar_config(disable=True)
 
 print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}, MODEL_ID={MODEL_ID}")
 
-
 # -----------------------------------------------------------------------------
-# Prompt parsing (minimal, rule-based)
+# Prompt parsing + scoring (v4)
 # -----------------------------------------------------------------------------
-def infer_edit_target(prompt_ko: str) -> str:
-    """
-    Extremely small rule-based intent classifier.
-
-    returns one of:
-      - "sleeve"  : 긴팔/반팔/소매 중심
-      - "top"     : 상의/셔츠/자켓
-      - "pants"   : 바지/하의
-      - "dress"   : 드레스/치마
-      - "generic" : fallback
-    """
-    p = (prompt_ko or "").lower()
+def infer_edit_target(prompt: str) -> str:
+    p = (prompt or "").lower()
 
     sleeve_keywords = ["긴팔", "반팔", "소매", "sleeve", "short sleeve", "long sleeve"]
     top_keywords = ["상의", "셔츠", "자켓", "재킷", "후드", "hoodie", "shirt", "jacket", "top"]
@@ -108,102 +101,153 @@ def infer_edit_target(prompt_ko: str) -> str:
         return "dress"
     return "generic"
 
-
-# -----------------------------------------------------------------------------
-# Auto mask scoring
-# -----------------------------------------------------------------------------
-def score_mask(target: str, mask_dict: dict, img_w: int, img_h: int) -> float:
-    """
-    Score SAM auto masks by heuristics.
-
-    The goal is not "semantic correctness"; it's selecting a plausible region quickly.
-    - target="sleeve": prefer left/right upper arm regions, moderate area, upper-half.
-    - target="top": prefer upper torso region, moderate-large area.
-    - target="pants": prefer lower-half region.
-    - generic: prefer medium area regions near center.
-
-    returns: score (higher is better)
-    """
+def score_mask_v4(target: str, mask_dict: dict, img_w: int, img_h: int) -> float:
     area = float(mask_dict.get("area", 0))
     bbox = mask_dict.get("bbox", [0, 0, 0, 0])
     cx, cy = bbox_center(bbox)
 
-    # normalize center
     nx = cx / max(1.0, img_w)
     ny = cy / max(1.0, img_h)
 
-    # area ratio
     a = area / max(1.0, float(img_w * img_h))
 
-    # basic area preference: avoid tiny specks and huge background-like masks
-    area_score = 1.0 - abs(a - 0.12) / 0.12  # peak at ~12%
-    area_score = clamp01(area_score)
+    if a < 0.003:
+        return 0.0
+    if a > 0.45:
+        return 0.0
 
-    # position scores
-    upper_score = 1.0 - abs(ny - 0.35) / 0.35  # peak upper third
-    upper_score = clamp01(upper_score)
+    area_peak = 0.12
+    area_score = clamp01(1.0 - abs(a - area_peak) / area_peak)
 
-    lower_score = 1.0 - abs(ny - 0.75) / 0.25
-    lower_score = clamp01(lower_score)
+    upper = clamp01(1.0 - abs(ny - 0.38) / 0.38)
+    mid = clamp01(1.0 - abs(ny - 0.55) / 0.45)
+    lower = clamp01(1.0 - abs(ny - 0.78) / 0.28)
+    center = clamp01(1.0 - abs(nx - 0.50) / 0.50)
 
-    center_score = 1.0 - abs(nx - 0.50) / 0.50
-    center_score = clamp01(center_score)
+    seg_bool = mask_dict["segmentation"]
+    human_roi = roi_mask(img_h, img_w, 0.20, 0.18, 0.80, 0.95)
+    human_overlap = overlap_ratio(seg_bool, human_roi)
+    if human_overlap < 0.30:
+        return 0.0
 
-    # sleeve: favor left/right mid positions (arms) and upper region
-    arm_left = 1.0 - abs(nx - 0.25) / 0.25
-    arm_right = 1.0 - abs(nx - 0.75) / 0.25
-    arm_score = clamp01(max(arm_left, arm_right))
+    head_roi = roi_mask(img_h, img_w, 0.15, 0.00, 0.85, 0.22)
+    head_leak = float((seg_bool & head_roi).sum()) / (float(seg_bool.sum()) + 1e-6)
+    head_penalty = clamp01(1.0 - head_leak * 2.5)
 
     if target == "sleeve":
-        return (0.45 * upper_score) + (0.35 * arm_score) + (0.20 * area_score)
+        left_arm_roi = roi_mask(img_h, img_w, 0.00, 0.22, 0.38, 0.72)
+        right_arm_roi = roi_mask(img_h, img_w, 0.62, 0.22, 1.00, 0.72)
+
+        left_overlap = overlap_ratio(seg_bool, left_arm_roi)
+        right_overlap = overlap_ratio(seg_bool, right_arm_roi)
+        arm_score = clamp01(max(left_overlap, right_overlap) / 0.75)
+
+        return (0.30 * upper) + (0.35 * arm_score) + (0.20 * area_score) + (0.15 * head_penalty)
+
     if target == "top":
-        return (0.50 * upper_score) + (0.30 * center_score) + (0.20 * area_score)
+        return (0.35 * upper) + (0.30 * center) + (0.20 * area_score) + (0.15 * head_penalty)
+
     if target == "pants":
-        return (0.55 * lower_score) + (0.25 * center_score) + (0.20 * area_score)
+        return (0.45 * lower) + (0.20 * center) + (0.20 * area_score) + (0.15 * head_penalty)
+
     if target == "dress":
-        # dress often spans mid-to-lower; bias to mid-lower and larger area
-        dress_area = 1.0 - abs(a - 0.22) / 0.22
-        dress_area = clamp01(dress_area)
-        mid_lower = 1.0 - abs(ny - 0.60) / 0.40
-        mid_lower = clamp01(mid_lower)
-        return (0.50 * mid_lower) + (0.30 * dress_area) + (0.20 * center_score)
+        return (0.35 * mid) + (0.25 * lower) + (0.25 * area_score) + (0.15 * head_penalty)
 
-    return (0.40 * center_score) + (0.40 * area_score) + (0.20 * upper_score)
+    return (0.35 * center) + (0.25 * upper) + (0.25 * area_score) + (0.15 * head_penalty)
 
+def pick_left_right_sleeve_masks(masks, img_w, img_h):
+    left_roi = roi_mask(img_h, img_w, 0.00, 0.22, 0.42, 0.74)
+    right_roi = roi_mask(img_h, img_w, 0.58, 0.22, 1.00, 0.74)
 
-def build_auto_candidates(sam_model_type: str, prompt_ko: str, top_k: int = 3):
-    """
-    Generate K candidate masks via SAM auto generator and heuristic scoring.
-    Stores candidates in STATE["auto_mask_candidates"] as uint8 masks 0/255.
-    """
+    best_left = None
+    best_left_score = -1.0
+    best_right = None
+    best_right_score = -1.0
+
+    for m in masks:
+        seg = m["segmentation"]
+        left_overlap = overlap_ratio(seg, left_roi)
+        right_overlap = overlap_ratio(seg, right_roi)
+
+        if left_overlap > 0.35:
+            s = left_overlap * 0.8 + (m.get("predicted_iou", 0.0) * 0.2)
+            if s > best_left_score:
+                best_left_score = s
+                best_left = m
+
+        if right_overlap > 0.35:
+            s = right_overlap * 0.8 + (m.get("predicted_iou", 0.0) * 0.2)
+            if s > best_right_score:
+                best_right_score = s
+                best_right = m
+
+    return best_left, best_right
+
+def build_auto_candidates_v4(sam_model_type: str, prompt: str, top_k: int = 3):
     if STATE["working_np"] is None:
         return [], "Upload an image first."
 
     img_np = STATE["working_np"]
     h, w = img_np.shape[:2]
 
-    target = infer_edit_target(prompt_ko)
+    target = infer_edit_target(prompt)
 
     masker = sam_manager.get(sam_model_type)
     masks = masker.auto_masks(img_np)
 
-    # sort by heuristic score
+    candidates = []
+
+    if target == "sleeve":
+        left_m, right_m = pick_left_right_sleeve_masks(masks, w, h)
+
+        union = None
+        if left_m is not None:
+            union = union_masks(union, sam_dict_to_uint8_mask(left_m))
+        if right_m is not None:
+            union = union_masks(union, sam_dict_to_uint8_mask(right_m))
+
+        if union is not None:
+            candidates.append(union)
+
+        scored = []
+        for m in masks:
+            s = score_mask_v4(target, m, w, h)
+            if s > 0:
+                scored.append((s, m))
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        for s, m in scored:
+            if len(candidates) >= top_k:
+                break
+            candidates.append(sam_dict_to_uint8_mask(m))
+
+        uniq = []
+        seen = set()
+        for c in candidates:
+            key = int(c.sum())
+            if key not in seen:
+                uniq.append(c)
+                seen.add(key)
+        candidates = uniq[:top_k]
+
+        STATE["auto_mask_candidates"] = candidates
+        return candidates, f"Auto masks v4 (sleeve). candidates={len(candidates)}"
+
     scored = []
     for m in masks:
-        s = score_mask(target, m, w, h)
-        scored.append((s, m))
+        s = score_mask_v4(target, m, w, h)
+        if s > 0:
+            scored.append((s, m))
     scored.sort(key=lambda x: x[0], reverse=True)
 
-    candidates = []
     for s, m in scored[:top_k]:
         candidates.append(sam_dict_to_uint8_mask(m))
 
     STATE["auto_mask_candidates"] = candidates
-    return candidates, f"Auto masks generated. target={target}, candidates={len(candidates)}"
-
+    return candidates, f"Auto masks v4 target={target}, candidates={len(candidates)}"
 
 # -----------------------------------------------------------------------------
-# Handlers
+# UI handlers
 # -----------------------------------------------------------------------------
 def on_upload(img_pil: Image.Image, work_long_side: int):
     if img_pil is None:
@@ -234,21 +278,17 @@ def on_click(evt: gr.SelectData, sam_model_type: str, expand_px: int, blur_px: i
     STATE["mask_np"] = mask
     return mask_to_pil(mask), f"Manual mask set at ({x},{y})."
 
-def on_auto_mask(sam_model_type: str, prompt_ko: str):
-    candidates, msg = build_auto_candidates(sam_model_type, prompt_ko, top_k=3)
+def on_auto_mask(sam_model_type: str, prompt: str):
+    candidates, msg = build_auto_candidates_v4(sam_model_type, prompt, top_k=3)
     if not candidates:
         return None, None, None, msg
 
-    # 후보를 이미지로 반환(최대 3개)
     c1 = mask_to_pil(candidates[0]) if len(candidates) > 0 else None
     c2 = mask_to_pil(candidates[1]) if len(candidates) > 1 else None
     c3 = mask_to_pil(candidates[2]) if len(candidates) > 2 else None
     return c1, c2, c3, msg
 
 def on_select_candidate(idx: int):
-    """
-    Candidate 선택 버튼 -> STATE["mask_np"]에 후보 마스크를 적용.
-    """
     cands = STATE.get("auto_mask_candidates", [])
     if idx < 0 or idx >= len(cands):
         return None, "No such candidate."
@@ -261,15 +301,7 @@ def clear_mask():
     return None, None, None, "Mask cleared."
 
 @torch.inference_mode()
-def apply_edit(
-    prompt: str,
-    negative_prompt: str,
-    steps: int,
-    strength: float,
-    guidance_scale: float,
-    expand_px: int,
-    blur_px: int,
-):
+def apply_edit(prompt, negative_prompt, steps, strength, guidance_scale, expand_px, blur_px):
     if STATE["working_pil"] is None:
         return None, "Upload an image first."
     if STATE["mask_np"] is None:
@@ -278,7 +310,6 @@ def apply_edit(
     image = STATE["working_pil"]
     mask_np = postprocess_mask(STATE["mask_np"], int(expand_px), int(blur_px))
     STATE["mask_np"] = mask_np
-    mask_pil = mask_to_pil(mask_np)
 
     if MOCK_INPAINT:
         preview = overlay_mask_on_image(image, mask_np)
@@ -286,6 +317,8 @@ def apply_edit(
 
     if prompt is None or prompt.strip() == "":
         return None, "Prompt is empty."
+
+    mask_pil = mask_to_pil(mask_np)
 
     result = pipe(
         prompt=prompt,
@@ -299,16 +332,14 @@ def apply_edit(
 
     return result, "Done."
 
-
 # -----------------------------------------------------------------------------
 # UI
 # -----------------------------------------------------------------------------
-with gr.Blocks(title="Local Image Edit (Manual + Auto Mask)") as demo:
+with gr.Blocks(title="Local Image Edit (v4 Auto Mask)") as demo:
     gr.Markdown(
-        "# Local Image Edit (SAM + SDXL Inpaint)\n"
-        "- Manual mask: click-based\n"
-        "- Auto mask: prompt-based heuristic selection over SAM auto proposals\n"
-        "- vit_b: faster, vit_h: more precise (slower)\n"
+        "# Local Image Edit (v4 Auto Mask)\n"
+        "- MOCK mode avoids importing diffusers/xformers entirely\n"
+        "- Sleeve mode unions left+right candidates\n"
     )
 
     with gr.Row():
@@ -329,7 +360,7 @@ with gr.Blocks(title="Local Image Edit (Manual + Auto Mask)") as demo:
 
             prompt = gr.Textbox(
                 label="Prompt (Korean/English)",
-                placeholder="예: 긴팔을 반팔로 바꿔줘, realistic fabric, natural arm",
+                placeholder="예: 긴팔을 반팔로 바꿔줘, short-sleeve, natural arm",
             )
             negative_prompt = gr.Textbox(
                 label="Negative Prompt",
@@ -337,7 +368,7 @@ with gr.Blocks(title="Local Image Edit (Manual + Auto Mask)") as demo:
             )
 
             with gr.Row():
-                btn_auto = gr.Button("Auto Mask (from prompt)")
+                btn_auto = gr.Button("Auto Mask (v4)")
                 btn_apply = gr.Button("Apply", variant="primary")
                 btn_clear = gr.Button("Clear Mask")
 
@@ -359,50 +390,25 @@ with gr.Blocks(title="Local Image Edit (Manual + Auto Mask)") as demo:
                 pick2 = gr.Button("Use #2")
                 pick3 = gr.Button("Use #3")
 
-    # Upload
-    input_img.change(
-        fn=on_upload,
-        inputs=[input_img, work_long_side],
-        outputs=[working_view, mask_preview, output_img, status],
-    )
+    input_img.change(fn=on_upload, inputs=[input_img, work_long_side],
+                     outputs=[working_view, mask_preview, output_img, status])
 
-    # Manual click mask
-    working_view.select(
-        fn=on_click,
-        inputs=[sam_model_type, expand_px, blur_px],
-        outputs=[mask_preview, status],
-    )
+    working_view.select(fn=on_click, inputs=[sam_model_type, expand_px, blur_px],
+                        outputs=[mask_preview, status])
 
-    # Auto mask
-    btn_auto.click(
-        fn=on_auto_mask,
-        inputs=[sam_model_type, prompt],
-        outputs=[cand1, cand2, cand3, status],
-    )
+    btn_auto.click(fn=on_auto_mask, inputs=[sam_model_type, prompt],
+                   outputs=[cand1, cand2, cand3, status])
 
-    # Pick candidate
     pick1.click(fn=lambda: on_select_candidate(0), inputs=[], outputs=[mask_preview, status])
     pick2.click(fn=lambda: on_select_candidate(1), inputs=[], outputs=[mask_preview, status])
     pick3.click(fn=lambda: on_select_candidate(2), inputs=[], outputs=[mask_preview, status])
 
-    # Apply
-    btn_apply.click(
-        fn=apply_edit,
-        inputs=[prompt, negative_prompt, steps, strength, guidance_scale, expand_px, blur_px],
-        outputs=[output_img, status],
-    )
+    btn_apply.click(fn=apply_edit,
+                    inputs=[prompt, negative_prompt, steps, strength, guidance_scale, expand_px, blur_px],
+                    outputs=[output_img, status])
 
-    # Clear
-    btn_clear.click(
-        fn=clear_mask,
-        inputs=[],
-        outputs=[mask_preview, cand1, cand2, status],  # cand3는 아래에서 따로 초기화
-    )
-    btn_clear.click(
-        fn=lambda: (None, "Mask cleared."),
-        inputs=[],
-        outputs=[cand3, status],
-    )
+    btn_clear.click(fn=clear_mask, inputs=[], outputs=[mask_preview, cand1, cand2, status])
+    btn_clear.click(fn=lambda: (None, "Mask cleared."), inputs=[], outputs=[cand3, status])
 
 if __name__ == "__main__":
     demo.launch(share=True)
