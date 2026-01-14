@@ -29,6 +29,12 @@ weights/
 *.ckpt
 *.onnx
 
+models/
+*.pht
+*.safetensors
+*.ckpt
+*.onnx
+
 # --- Outputs ---
 outputs/
 *.png
