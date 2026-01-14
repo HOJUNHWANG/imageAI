@@ -1,3 +1,4 @@
+# venv311\Scripts\activate
 # app.py
 import os
 import time
@@ -961,16 +962,16 @@ def build_ui():
                     output = gr.Image(label="Result", type="pil", height=520)
                     run_status = gr.Textbox(label="Run Status", interactive=False, lines=2, max_lines=6)
 
-        # ============================================================
-        # Events
-        # ============================================================
-        # TODO(1): 네 app.py에 존재하는 함수 이름 그대로 유지해야 함
-        #   - on_upload
-        #   - on_manual_click
-        #   - build_auto_candidates_v5  (또는 build_auto_candidates_v4/v5)
-        #   - select_candidate
-        #   - clear_mask
-        #   - apply_inpaint
+    # ============================================================
+    # Events
+    # ============================================================
+    # TODO(1): 네 app.py에 존재하는 함수 이름 그대로 유지해야 함
+    #   - on_upload
+    #   - on_manual_click
+    #   - build_auto_candidates_v5  (또는 build_auto_candidates_v4/v5)
+    #   - select_candidate
+    #   - clear_mask
+    #   - apply_inpaint
 
         # 업로드 처리
         input_image.upload(
