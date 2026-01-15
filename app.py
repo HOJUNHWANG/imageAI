@@ -4,7 +4,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # 에러 자세히 보기
 import time
-import psutil  # RAM 사용량 확인용 (필요 시 pip install psutil)
+import psutil  # RAM 사용량 확인용
 import re
 import numpy as np
 from PIL import Image, ImageFilter
@@ -23,6 +23,74 @@ try:
     import cv2
 except Exception:
     cv2 = None
+
+import cv2
+from PIL import Image
+import gradio as gr
+import torch
+import traceback
+
+from sam_utils import SamMaskerManager
+from mp_tasks_utils import MPTasksHelper, build_sleeve_mask_v5_tasks, build_top_mask_v5_tasks
+
+from prompt_enricher import enrich_positive, enrich_negative
+from mp_tasks_utils import (
+    build_sleeve_mask_v5_tasks,
+    build_top_mask_v5_tasks,
+    build_pants_mask_v5_tasks,
+    build_hair_mask_v5_tasks,
+    build_background_mask_v5_tasks,
+)
+
+# -----------------------------------------------------------------------------
+# Runtime configuration
+# -----------------------------------------------------------------------------
+
+BASE_DIR = os.path.dirname(__file__)
+WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
+MODELS_DIR = os.path.join(BASE_DIR, "models", "stable-diffusion-xl")
+
+JUGGERNAUT_INPAINT = os.path.join(MODELS_DIR, "juggernautXL_ragnarokBy.safetensors")
+DEFAULT_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+
+CONTROLNET_DEPTH = os.path.join(BASE_DIR, "models", "ControlNet", "controlnet-depth-sdxl-1.0")
+CONTROLNET_OPENPOSE = os.path.join(BASE_DIR, "models", "ControlNet", "controlnet-openpose-sdxl-1.0")
+
+MOCK_INPAINT = os.getenv("MOCK_INPAINT", "0") == "1"
+
+def pick_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+DEVICE = pick_device()
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}")
+
+# -----------------------------------------------------------------------------
+# Global state
+# -----------------------------------------------------------------------------
+
+STATE = {
+    "working_pil": None,
+    "working_np": None,
+    "orig_pil": None,
+    "mask_u8": None,
+    "selected_mask": None,
+    "auto_mask_candidates": []
+}
+
+# Global pipelines (캐싱)
+pipe = None
+controlnet_pipes = {}
+img2img_pipe = None
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
 
 def normalize_space(s: str) -> str:
     s = (s or "").strip()
@@ -48,7 +116,7 @@ def build_default_negative(mode: str) -> str:
         "extra arms", "extra hands", "extra fingers", "missing fingers",
         "plastic skin", "over-smoothed skin", "uncanny", "text", "watermark", "logo"
     ]
-    wear_block = ["bare chest", "nipples", "shirtless"]  # 옷입히기 모드에서 상반신 노출 방지
+    wear_block = ["bare chest", "nipples", "shirtless"]
     remove_block = ["shirt", "t-shirt", "top", "clothing", "fabric", "textile", "sweater", "hoodie", "jacket", "vest"]
 
     if mode == "Wear / Change Clothes":
@@ -58,10 +126,6 @@ def build_default_negative(mode: str) -> str:
     return comma_join_unique(base)
 
 def enrich_prompt(prompt: str, mode: str) -> str:
-    """
-    자연어 -> diffusion 토큰 느낌으로 확장
-    핵심: remove 모드에서는 fabric/cloth 관련 긍정 토큰을 넣지 말 것.
-    """
     p = normalize_space(prompt)
     if not p:
         return ""
@@ -98,93 +162,6 @@ def enrich_prompt(prompt: str, mode: str) -> str:
 
     return comma_join_unique([p] + common_quality)
 
-import cv2
-from PIL import Image
-import gradio as gr
-
-theme = gr.themes.Soft(
-    primary_hue="orange",
-    secondary_hue="slate",
-    neutral_hue="slate",
-    radius_size="lg",
-)
-
-import torch
-
-print("[HW] torch version:", torch.__version__)
-print("[HW] cuda available:", torch.cuda.is_available())
-print("[HW] cuda device count:", torch.cuda.device_count())
-if torch.cuda.is_available():
-    print("[HW] cuda name:", torch.cuda.get_device_name(0))
-print("[HW] torch cuda build:", torch.version.cuda)
-
-import traceback
-
-from sam_utils import SamMaskerManager
-from mp_tasks_utils import MPTasksHelper, build_sleeve_mask_v5_tasks, build_top_mask_v5_tasks
-from ui_text import APP_TITLE, APP_SUBTITLE, HOW_TO_MD, SLIDER_HINTS_MD
-
-from prompt_enricher import enrich_positive, enrich_negative
-from mp_tasks_utils import (
-    build_sleeve_mask_v5_tasks,
-    build_top_mask_v5_tasks,
-    build_pants_mask_v5_tasks,
-    build_hair_mask_v5_tasks,
-    build_background_mask_v5_tasks,
-)
-
-# -----------------------------------------------------------------------------
-# Runtime configuration
-# -----------------------------------------------------------------------------
-
-BASE_DIR = os.path.dirname(__file__)
-WEIGHTS_DIR = os.path.join(BASE_DIR, "weights")
-MODELS_DIR = os.path.join(BASE_DIR, "models", "stable-diffusion-xl")
-
-# 경로
-JUGGERNAUT_INPAINT = os.path.join(MODELS_DIR, "juggernautXL_ragnarokBy.safetensors")
-# fallback
-DEFAULT_MODEL = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
-
-# ControlNet 경로
-CONTROLNET_DEPTH = os.path.join(BASE_DIR, "models", "ControlNet", "controlnet-depth-sdxl-1.0")
-CONTROLNET_OPENPOSE = os.path.join(BASE_DIR, "models", "ControlNet", "controlnet-openpose-sdxl-1.0")
-
-MOCK_INPAINT = os.getenv("MOCK_INPAINT", "0") == "1"
-
-def pick_device() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-DEVICE = pick_device()
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
-
-print(f"DEVICE={DEVICE}, MOCK_INPAINT={MOCK_INPAINT}")
-
-# -----------------------------------------------------------------------------
-# Global state
-# -----------------------------------------------------------------------------
-
-STATE = {
-    "working_pil": None,
-    "working_np": None,
-    "orig_pil": None,
-    "mask_u8": None,
-    "selected_mask": None, 
-    "auto_mask_candidates": []
-}
-
-# Global pipelines (캐싱)
-pipe = None
-controlnet_pipes = {}
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
 def resize_to_long_side(pil: Image.Image, long_side: int) -> Image.Image:
     w, h = pil.size
     if max(w, h) == long_side:
@@ -211,11 +188,11 @@ def postprocess_mask(mask_u8: np.ndarray, expand_px: int, blur_px: int) -> np.nd
 
     if expand_px > 0:
         k = expand_px * 2 + 1
-        m = cv2.dilate(m, np.ones((k, k), np.uint8), iterations=1)
+        m = cv2.dilate(m, np.ones((k, k), np.uint8), iterations=1) if cv2 is not None else m
 
     if blur_px > 0:
         k = blur_px * 2 + 1
-        m = cv2.GaussianBlur(m, (k, k), 0)
+        m = cv2.GaussianBlur(m, (k, k), 0) if cv2 is not None else m
 
     return np.clip(m, 0, 255).astype(np.uint8)
 
@@ -228,8 +205,8 @@ def refine_mask_soft(mask_u8: np.ndarray, expand_px: int, blur_px: int) -> np.nd
         m = m[..., 0]
     m = (m > 127).astype(np.uint8) * 255
 
-    # 1) Expand (dilation)
-    if expand_px and expand_px > 0:
+    # Expand (dilation)
+    if expand_px > 0:
         if cv2 is not None:
             k = max(1, int(expand_px))
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*k+1, 2*k+1))
@@ -240,8 +217,8 @@ def refine_mask_soft(mask_u8: np.ndarray, expand_px: int, blur_px: int) -> np.nd
             img = img.filter(ImageFilter.MaxFilter(size=size))
             m = np.array(img, dtype=np.uint8)
 
-    # 2) Blur / Feather (soft edge)
-    if blur_px and blur_px > 0:
+    # Blur / Feather (soft edge)
+    if blur_px > 0:
         if cv2 is not None:
             sigma = max(0.1, blur_px / 2.0)
             m = cv2.GaussianBlur(m, (0, 0), sigmaX=sigma, sigmaY=sigma)
@@ -254,6 +231,7 @@ def refine_mask_soft(mask_u8: np.ndarray, expand_px: int, blur_px: int) -> np.nd
 
 def parse_prompt_simple(prompt: str) -> dict:
     p = (prompt or "").lower()
+
     sleeve_kw = ["sleeve", "sleeveless", "tank", "crop top", "short sleeve", "long sleeve"]
     top_kw = ["shirt", "t-shirt", "top", "blouse", "jacket", "hoodie", "sweater"]
 
@@ -302,13 +280,12 @@ def load_pipe():
             torch_dtype=dtype,
             variant="fp16" if "safetensors" in model_path.lower() and DEVICE == "cuda" else None,
             use_safetensors=True,
-            safety_checker=None,  # NSFW 필터 off (옵션)
+            safety_checker=None,
         )
 
-        # GPU 최적화: offload 비활성화 (3080 Ti면 필요 없음)
+        # GPU 최적화: offload 비활성화
         if DEVICE == "cuda":
             pipe.to("cuda")
-            # cpu_offload 끄기 (메모리/속도 문제 방지)
             if hasattr(pipe, "disable_model_cpu_offload"):
                 pipe.disable_model_cpu_offload()
             print("[GPU] Disabled cpu_offload - full GPU acceleration enabled")
@@ -317,13 +294,13 @@ def load_pipe():
             pipe.to("cpu")
             print("[CPU] Running on CPU - generation will be slow")
 
-        # VAE / Text Encoder 등 컴포넌트 명시적 이동 (로드 안정성 ↑)
+        # 컴포넌트 이동
         pipe.vae.to(DEVICE)
         pipe.text_encoder.to(DEVICE)
         pipe.text_encoder_2.to(DEVICE)
         pipe.unet.to(DEVICE)
 
-        # Warm-up: GPU 초기화 & 메모리 할당 테스트
+        # Warm-up
         print("[PIPE] Running warm-up dummy inference...")
         try:
             dummy_image = Image.new("RGB", (512, 512), color="white")
@@ -338,16 +315,16 @@ def load_pipe():
             ).images[0]
             print("[PIPE] Warm-up success! GPU/VRAM ready")
         except Exception as warm_up_e:
-            print(f"[PIPE] Warm-up failed (non-fatal, continuing): {str(warm_up_e)}")
+            print(f"[PIPE] Warm-up failed (non-fatal): {str(warm_up_e)}")
 
-        # 최종 상태 출력
+        # 최종 상태
         print("[PIPE] Loaded successfully!")
         print(f"[PIPE] Pipeline class: {type(pipe).__name__}")
         print(f"[PIPE] Scheduler: {type(pipe.scheduler).__name__}")
         print(f"[PIPE] Device map: {pipe.device}")
         print(f"[PIPE] UNet dtype: {next(pipe.unet.parameters()).dtype}")
 
-        # xformers (속도 향상, GPU에서만)
+        # xformers (GPU에서만)
         if DEVICE == "cuda":
             try:
                 pipe.enable_xformers_memory_efficient_attention()
@@ -364,7 +341,6 @@ def load_pipe():
 
 PIPE = load_pipe()
 
-# MediaPipe & SAM
 mp_helper = None
 try:
     mp_helper = MPTasksHelper(weights_dir=WEIGHTS_DIR)
@@ -388,11 +364,11 @@ def on_upload(img: Image.Image, working_long_side: int):
     STATE["working_pil"] = working
     STATE["working_np"] = to_rgb_np(working)
     STATE["mask_u8"] = None
-    STATE["auto_mask_candidates"] = []
     STATE["selected_mask"] = None
+    STATE["auto_mask_candidates"] = []
 
     status_msg = "Image loaded. Choose Auto Mask or click for Manual Mask."
-    return working, None, status_msg, status_msg   # ← 4개 반환 (image, image, textbox, textbox)
+    return working, None, status_msg, status_msg
 
 def on_manual_click(evt: gr.SelectData, sam_model_type: str):
     if STATE["working_np"] is None:
@@ -410,7 +386,7 @@ def on_manual_click(evt: gr.SelectData, sam_model_type: str):
     mask_preview = Image.fromarray(mask_u8)
 
     status_msg = f"Manual mask built (SAM {sam_model_type})."
-    return Image.fromarray(vis), mask_preview, status_msg, status_msg   # ← 4개 반환
+    return Image.fromarray(vis), mask_preview, status_msg, status_msg
 
 def build_auto_candidates_v5(prompt: str, auto_enrich: bool, edit_mode: str):
     t0 = time.time()
@@ -470,32 +446,19 @@ def build_auto_candidates_v5(prompt: str, auto_enrich: bool, edit_mode: str):
         return [], str(e), expanded
 
 def select_candidate(evt: gr.SelectData):
-    """
-    Selects a candidate from the gallery and sets it as current mask.
-    """
     idx = evt.index
-    if idx is None:
+    if idx is None or not STATE["auto_mask_candidates"]:
         return None, None, "No selection.", "No selection."
-
-    if not STATE["auto_mask_candidates"] or idx >= len(STATE["auto_mask_candidates"]):
-        return None, None, "No candidates in state.", "No candidates in state."
 
     mask_u8 = STATE["auto_mask_candidates"][idx]
     STATE["mask_u8"] = mask_u8
     STATE["selected_mask"] = mask_u8
 
     vis = overlay_mask(STATE["working_np"], mask_u8)
-    mask_preview = Image.fromarray(mask_u8)  # 마스크 미리보기용
+    mask_preview = Image.fromarray(mask_u8)
 
     status_msg = f"Candidate {idx+1} selected as active mask."
-    
-    # 4개 반환: mask_overlay, selected_mask_preview, auto_status, global_status
-    return (
-        Image.fromarray(vis),          # mask_overlay
-        mask_preview,                  # selected_mask_preview
-        status_msg,                    # auto_status
-        status_msg                     # global_status
-    )
+    return Image.fromarray(vis), mask_preview, status_msg, status_msg
 
 def clear_mask():
     STATE["mask_u8"] = None
@@ -550,7 +513,7 @@ def apply_inpaint(
 
     merged_neg = comma_join_unique([negative or "", build_default_negative(edit_mode)])
 
-    # 모드별 clamp (CPU 고려)
+    # 모드별 clamp
     if edit_mode == "Remove Clothes":
         strength = min(max(strength, 0.45), 0.92)
         guidance = max(guidance, 7.0)
@@ -617,7 +580,6 @@ def apply_inpaint(
                     guidance_scale=guidance,
                     generator=gen
                 ).images[0]
-                print("[CONTROLNET] Generation success!")
             except Exception as e:
                 print(f"[CONTROLNET] Generation failed: {str(e)} → fallback")
                 use_controlnet = False
@@ -627,55 +589,25 @@ def apply_inpaint(
             load_pipe()
 
         print("[INPAINT] Using base Juggernaut XL Inpainting")
+        result = pipe(
+            prompt=expanded,
+            negative_prompt=merged_neg,
+            image=image_pil,
+            mask_image=mask_pil,
+            num_inference_steps=steps,
+            strength=strength,
+            guidance_scale=guidance,
+            generator=gen
+        ).images[0]
 
-        # GPU 환경 최적화: offload 비활성화 (3080 Ti면 필요 없음)
-        if DEVICE == "cuda":
-            pipe.to("cuda")
-            # offload 끄기 (메모리 부족 방지 + 속도 향상)
-            if hasattr(pipe, "disable_model_cpu_offload"):
-                pipe.disable_model_cpu_offload()
-            print("[GPU] Disabled cpu_offload for faster generation")
+    print(f"[SUCCESS] First generation completed in {time.time() - t0:.1f}s")
 
-        # strength → effective_steps 변환 (슬라이스 에러 완전 방지)
-        effective_steps = max(10, int(steps * strength))
-        print(f"[FIX] Effective steps: {effective_steps} (strength={strength}, original steps={steps})")
-
-        try:
-            # 입력 타입 강제 확인 & 변환
-            if not isinstance(image_pil, Image.Image):
-                print("[FIX] Converting image_pil to PIL")
-                image_pil = Image.fromarray(image_pil) if isinstance(image_pil, np.ndarray) else image_pil
-
-            if not isinstance(mask_pil, Image.Image):
-                print("[FIX] Converting mask_pil to PIL")
-                mask_pil = Image.fromarray(mask_pil) if isinstance(mask_pil, np.ndarray) else mask_pil
-
-            result = pipe(
-                prompt=expanded,
-                negative_prompt=merged_neg,
-                image=image_pil,
-                mask_image=mask_pil,
-                num_inference_steps=effective_steps,
-                guidance_scale=guidance,
-                generator=gen,
-                # strength 제거 (steps로 대체했으니)
-            ).images[0]
-
-            print("[INPAINT] Generation success! Result type:", type(result))
-        except Exception as e:
-            print(f"[INPAINT] Generation failed with error: {str(e)}")
-            result = None
-
-        if result is None:
-            print("[ERROR] Generation returned None - check prompt, mask, image size")
-
-    # Refine pass (do_refine 체크 시에만 실행)
+    # Refine pass
     refined = result  # 기본값: refine 안 하면 첫 결과 그대로
     if do_refine:
         print("[REFINE] Refine pass 시작 (추가 시간 소요)")
         try:
-            if 'img2img_pipe' not in globals():
-                global img2img_pipe
+            if img2img_pipe is None:
                 model_path = JUGGERNAUT_INPAINT if os.path.exists(JUGGERNAUT_INPAINT) else DEFAULT_MODEL
                 img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_single_file(
                     model_path,
@@ -711,10 +643,6 @@ def apply_inpaint(
             print(f"[REFINE] Skipped due to error: {e}")
             refined = result
 
-    else:
-        print("[REFINE] Refine pass skipped by user")
-
-    # ===================================================
     # 모든 과정 끝난 후 시간 계산 (refine 여부 상관없이 항상 여기서)
     dt = time.time() - t0
 
@@ -854,5 +782,5 @@ if __name__ == "__main__":
         share=False,
         prevent_thread_lock=True,
         css=CSS,
-        theme=theme
+        theme=gr.Theme
     )

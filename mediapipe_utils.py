@@ -1,50 +1,23 @@
+# mediapipe_utils.py
 import numpy as np
 import cv2
 from PIL import Image
 
-# -----------------------------------------------------------------------------
-# MediaPipe 기반 "의미-근사" 마스킹 유틸
-#
-# - SelfieSegmentation: 사람(전경) 마스크
-# - Pose: 어깨/팔꿈치/손목 랜드마크 -> 팔 영역을 도형으로 근사
-#
-# 이 모듈의 목적:
-# - "상의/소매 편집"에서 필요한 영역(상의 + 팔 노출 예상 영역)을 자동으로 생성
-# - 외부 웨이트 파일 다운로드 없이 pip 설치만으로 바로 테스트 가능
-# -----------------------------------------------------------------------------
+import mediapipe as mp
 
 class MPHelper:
     def __init__(self):
-        # Lazy import: CPU PC에서도 import 비용 최소화
-        import mediapipe as mp
         self.mp = mp
+        self.seg = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=0)  # 0 for faster
+        self.pose = mp.solutions.pose.Pose(model_complexity=1, min_detection_confidence=0.5)
 
-        # 모델 선택:
-        # - SelfieSegmentation(model_selection=1): 일반적으로 0보다 조금 더 품질 좋은 편
-        self.seg = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
-
-        # Pose:
-        # - model_complexity=1: CPU에서도 현실적으로 돌릴만한 밸런스
-        self.pose = mp.solutions.pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-        )
-
-    def person_mask(self, image_pil: Image.Image, threshold: float = 0.2) -> np.ndarray:
-        """
-        Returns:
-          uint8 mask (0/255) of person foreground.
-        """
-        img = np.array(image_pil.convert("RGB"))
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-        res = self.seg.process(img_bgr)
-        m = res.segmentation_mask  # float [0..1], shape (H,W)
-
-        mask = (m > float(threshold)).astype(np.uint8) * 255
-        return mask
+    def person_mask(self, pil: Image.Image, threshold: float = 0.5) -> np.ndarray:
+        """Generate person mask from image."""
+        img = np.array(pil.convert("RGB"))
+        h, w = img.shape[:2]
+        result = self.seg.process(img)
+        mask = (result.segmentation_mask > threshold).astype(np.uint8) * 255
+        return cv2.resize(mask, (w, h), interpolation=cv2.INTER_LINEAR)
 
     def pose_landmarks(self, image_pil: Image.Image):
         """
