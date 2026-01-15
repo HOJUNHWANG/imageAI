@@ -1,12 +1,13 @@
 # venv311\Scripts\activate
 # app.py
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import re
 import numpy as np
 from PIL import Image, ImageFilter
-import random
 import torch
+torch.cuda.empty_cache()
 from diffusers import (
     StableDiffusionXLInpaintPipeline,
     ControlNetModel,
@@ -98,6 +99,14 @@ def enrich_prompt(prompt: str, mode: str) -> str:
 import cv2
 from PIL import Image
 import gradio as gr
+
+theme = gr.themes.Soft(
+    primary_hue="orange",
+    secondary_hue="slate",
+    neutral_hue="slate",
+    radius_size="lg",
+)
+
 import torch
 
 print("[HW] torch version:", torch.__version__)
@@ -274,38 +283,82 @@ def parse_prompt_simple(prompt: str) -> dict:
 def load_pipe():
     global pipe
     if MOCK_INPAINT:
-        print("[MODEL] MOCK_INPAINT mode - no real model loaded")
+        print("[PIPE] MOCK_INPAINT mode - no real model loaded")
         return None
 
-    # CPU일 때 float32 사용 (float16은 CUDA에서만 안정적)
-    dtype = torch.float32 if DEVICE == "cpu" else torch.float16
+    dtype = torch.float16 if DEVICE == "cuda" else torch.float32
 
     model_path = JUGGERNAUT_INPAINT if os.path.exists(JUGGERNAUT_INPAINT) else DEFAULT_MODEL
 
-    print(f"[MODEL] Loading checkpoint from: {model_path}")
-    print(f"[MODEL] Using device: {DEVICE}")
-    print(f"[MODEL] Using dtype: {dtype}")
+    print(f"[PIPE] Loading checkpoint from: {model_path}")
+    print(f"[PIPE] Target device: {DEVICE}")
+    print(f"[PIPE] Using dtype: {dtype}")
 
-    pipe = StableDiffusionXLInpaintPipeline.from_single_file(
-        model_path,
-        torch_dtype=dtype,
-        use_safetensors=True,
-    )
+    try:
+        pipe = StableDiffusionXLInpaintPipeline.from_single_file(
+            model_path,
+            torch_dtype=dtype,
+            variant="fp16" if "safetensors" in model_path.lower() and DEVICE == "cuda" else None,
+            use_safetensors=True,
+            safety_checker=None,  # NSFW 필터 off (옵션)
+        )
 
-    pipe.to(DEVICE)
+        # GPU 최적화: offload 비활성화 (3080 Ti면 필요 없음)
+        if DEVICE == "cuda":
+            pipe.to("cuda")
+            # cpu_offload 끄기 (메모리/속도 문제 방지)
+            if hasattr(pipe, "disable_model_cpu_offload"):
+                pipe.disable_model_cpu_offload()
+            print("[GPU] Disabled cpu_offload - full GPU acceleration enabled")
 
-    # CPU에서는 offload 비활성화 (의미 없음)
-    if DEVICE == "cuda":
-        pipe.enable_model_cpu_offload()
+        else:
+            pipe.to("cpu")
+            print("[CPU] Running on CPU - generation will be slow")
+
+        # VAE / Text Encoder 등 컴포넌트 명시적 이동 (로드 안정성 ↑)
+        pipe.vae.to(DEVICE)
+        pipe.text_encoder.to(DEVICE)
+        pipe.text_encoder_2.to(DEVICE)
+        pipe.unet.to(DEVICE)
+
+        # Warm-up: GPU 초기화 & 메모리 할당 테스트
+        print("[PIPE] Running warm-up dummy inference...")
         try:
-            pipe.enable_xformers_memory_efficient_attention()
-        except:
-            pass
-    else:
-        print("[INFO] Running on CPU - generation will be slow (10~30분 per image)")
+            dummy_image = Image.new("RGB", (512, 512), color="white")
+            dummy_mask = Image.new("L", (512, 512), color=0)
+            _ = pipe(
+                prompt="a photo of a cat",
+                image=dummy_image,
+                mask_image=dummy_mask,
+                num_inference_steps=1,
+                strength=0.01,
+                guidance_scale=1.0
+            ).images[0]
+            print("[PIPE] Warm-up success! GPU/VRAM ready")
+        except Exception as warm_up_e:
+            print(f"[PIPE] Warm-up failed (non-fatal, continuing): {str(warm_up_e)}")
 
-    print("[MODEL] Juggernaut XL loaded successfully!")
-    return pipe
+        # 최종 상태 출력
+        print("[PIPE] Loaded successfully!")
+        print(f"[PIPE] Pipeline class: {type(pipe).__name__}")
+        print(f"[PIPE] Scheduler: {type(pipe.scheduler).__name__}")
+        print(f"[PIPE] Device map: {pipe.device}")
+        print(f"[PIPE] UNet dtype: {next(pipe.unet.parameters()).dtype}")
+
+        # xformers (속도 향상, GPU에서만)
+        if DEVICE == "cuda":
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                print("[OPT] xformers enabled - faster attention")
+            except Exception:
+                print("[OPT] xformers not available (fallback to default)")
+
+        return pipe
+
+    except Exception as e:
+        print(f"[PIPE] Load failed: {str(e)}")
+        print("[PIPE] Check model path, safetensors file, or diffusers version")
+        return None
 
 PIPE = load_pipe()
 
@@ -465,7 +518,6 @@ def apply_inpaint(
     controlnet_type: str = "depth",
     do_refine: bool = False
 ):
-    import time
     t0 = time.time()
 
     if MOCK_INPAINT:
@@ -561,37 +613,65 @@ def apply_inpaint(
             load_pipe()
 
         print("[INPAINT] Using base Juggernaut XL Inpainting")
-        result = pipe(
-            prompt=expanded,
-            negative_prompt=merged_neg,
-            image=image_pil,
-            mask_image=mask_pil,
-            num_inference_steps=steps,
-            strength=strength,
-            guidance_scale=guidance,
-            generator=gen
-        ).images[0]
 
-    print(f"[SUCCESS] First generation completed in {time.time() - t0:.1f}s")
+        # GPU 환경 최적화: offload 비활성화 (3080 Ti면 필요 없음)
+        if DEVICE == "cuda":
+            pipe.to("cuda")
+            # offload 끄기 (메모리 부족 방지 + 속도 향상)
+            if hasattr(pipe, "disable_model_cpu_offload"):
+                pipe.disable_model_cpu_offload()
+            print("[GPU] Disabled cpu_offload for faster generation")
 
-    # Refine pass 완전 스킵 (연결 끊김 문제 해결 + 시간 단축)
-    refined = result
+        # strength → effective_steps 변환 (슬라이스 에러 완전 방지)
+        effective_steps = max(10, int(steps * strength))
+        print(f"[FIX] Effective steps: {effective_steps} (strength={strength}, original steps={steps})")
+
+        try:
+            # 입력 타입 강제 확인 & 변환
+            if not isinstance(image_pil, Image.Image):
+                print("[FIX] Converting image_pil to PIL")
+                image_pil = Image.fromarray(image_pil) if isinstance(image_pil, np.ndarray) else image_pil
+
+            if not isinstance(mask_pil, Image.Image):
+                print("[FIX] Converting mask_pil to PIL")
+                mask_pil = Image.fromarray(mask_pil) if isinstance(mask_pil, np.ndarray) else mask_pil
+
+            result = pipe(
+                prompt=expanded,
+                negative_prompt=merged_neg,
+                image=image_pil,
+                mask_image=mask_pil,
+                num_inference_steps=effective_steps,
+                guidance_scale=guidance,
+                generator=gen,
+                # strength 제거 (steps로 대체했으니)
+            ).images[0]
+
+            print("[INPAINT] Generation success! Result type:", type(result))
+        except Exception as e:
+            print(f"[INPAINT] Generation failed with error: {str(e)}")
+            result = None
+
+        if result is None:
+            print("[ERROR] Generation returned None - check prompt, mask, image size")
+
+    # Refine pass (do_refine 체크 시에만 실행)
+    refined = result  # 기본값: refine 안 하면 첫 결과 그대로
     if do_refine:
         print("[REFINE] Refine pass 시작 (추가 시간 소요)")
         try:
-            # img2img 파이프라인 로드 (한 번만)
             if 'img2img_pipe' not in globals():
                 global img2img_pipe
                 model_path = JUGGERNAUT_INPAINT if os.path.exists(JUGGERNAUT_INPAINT) else DEFAULT_MODEL
                 img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_single_file(
                     model_path,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
                     use_safetensors=True,
                 )
                 img2img_pipe.to(DEVICE)
                 print("[REFINE] Img2Img pipeline loaded")
 
-            # result → PIL.Image 강제 변환
+            # result 타입 안전 변환
             if not isinstance(result, Image.Image):
                 print(f"[REFINE] Converting result type: {type(result)} → PIL")
                 if isinstance(result, np.ndarray):
@@ -601,14 +681,13 @@ def apply_inpaint(
                     result = Image.fromarray((result * 255).astype(np.uint8))
                 else:
                     print("[REFINE] Unknown type, skipping refine")
-                    refined = result
                     raise Exception("Skip")
 
             refined = img2img_pipe(
                 prompt=expanded,
                 image=result,
                 strength=0.20,
-                num_inference_steps=10,  # CPU라 10 steps로
+                num_inference_steps=10,
                 guidance_scale=guidance,
                 generator=gen
             ).images[0]
@@ -616,15 +695,22 @@ def apply_inpaint(
             print("[REFINE] Refine pass completed")
         except Exception as e:
             print(f"[REFINE] Skipped due to error: {e}")
-            refined = result  # 실패해도 첫 결과 반환
+            refined = result
+
     else:
         print("[REFINE] Refine pass skipped by user")
 
+    # ===================================================
+    # 모든 과정 끝난 후 시간 계산 (refine 여부 상관없이 항상 여기서)
     dt = time.time() - t0
-    model_info = f"Juggernaut XL | ControlNet: {use_controlnet} ({controlnet_type}) | Refine: {do_refine} | Time: {dt//60:.0f}m {dt%60:.0f}s"
-    run_msg = f"완료! {model_info}"
 
-    return refined, run_msg, expanded, model_info
+    # 결과 이미지 결정
+    final_image = refined if do_refine and refined is not None else result
+
+    model_info = f"Juggernaut XL | ControlNet: {use_controlnet} ({controlnet_type}) | Refine: {do_refine}"
+    run_msg = f"완료! {model_info} | Time: {int(dt // 60)}m {int(dt % 60)}s"
+
+    return final_image, run_msg, expanded, model_info
 
 # -----------------------------------------------------------------------------
 # UI
@@ -660,7 +746,7 @@ def build_ui():
         radius_size="lg",
     )
 
-    with gr.Blocks(css=CSS, theme=theme, title="ImageAI Inpaint Lab") as demo:
+    with gr.Blocks(title="ImageAI Inpaint Lab") as demo:
         gr.Markdown("## ImageAI Inpaint Lab (Juggernaut XL + ControlNet)")
 
         with gr.Row():
@@ -741,4 +827,18 @@ def build_ui():
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.queue().launch(server_name="127.0.0.1", server_port=7860)
+    # queue()에 timeout 관련 옵션 제거 (Gradio 6.0 호환)
+    demo.queue(
+        max_size=10,  # 큐 크기 제한 (대기열 관리용)
+        # concurrency_count, timeout 등 제거
+    )
+
+    demo.launch(
+        server_name="127.0.0.1",
+        server_port=7860,
+        debug=True,               # 디버그 모드 켜서 로그 자세히
+        share=False,
+        prevent_thread_lock=True,
+        css=CSS,
+        theme=theme
+    )
