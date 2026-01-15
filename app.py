@@ -2,7 +2,9 @@
 # app.py
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # 에러 자세히 보기
 import time
+import psutil  # RAM 사용량 확인용 (필요 시 pip install psutil)
 import re
 import numpy as np
 from PIL import Image, ImageFilter
@@ -561,18 +563,26 @@ def apply_inpaint(
     print(f"[START] Generation start | mode={edit_mode} | controlnet={use_controlnet} | steps={steps}")
 
     if use_controlnet:
+        if controlnet_type == "depth":
+            repo = CONTROLNET_DEPTH
+        elif controlnet_type == "openpose":
+            repo = CONTROLNET_OPENPOSE
+        else:
+            repo = "lllyasviel/control_v11p_sd15_inpaint"
+
         key = f"{controlnet_type}_{strength:.2f}"
         if key not in controlnet_pipes:
-            print(f"[CONTROLNET] Loading {controlnet_type} ... (CPU라 오래 걸릴 수 있음)")
-            if controlnet_type == "depth":
-                repo = CONTROLNET_DEPTH
-            elif controlnet_type == "openpose":
-                repo = CONTROLNET_OPENPOSE
-            else:
-                repo = "lllyasviel/control_v11p_sd15_inpaint"
-
+            print(f"[CONTROLNET] Loading {controlnet_type} from: {repo} ... (CPU라 오래 걸릴 수 있음)")
+            print(f"[CONTROLNET] Current RAM usage before load: {psutil.virtual_memory().percent}%")
             try:
-                controlnet = ControlNetModel.from_pretrained(repo, torch_dtype=torch.float32)
+                controlnet = ControlNetModel.from_pretrained(
+                    repo,
+                    torch_dtype=torch.float32,
+                    use_safetensors=True,
+                    local_files_only=True
+                )
+                print("[CONTROLNET] ControlNet loaded! RAM now: {psutil.virtual_memory().percent}%")
+
                 controlnet_pipes[key] = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
                     JUGGERNAUT_INPAINT,
                     controlnet=controlnet,
@@ -580,12 +590,15 @@ def apply_inpaint(
                     use_safetensors=True,
                 )
                 controlnet_pipes[key].to(DEVICE)
-                print("[CONTROLNET] Loaded successfully")
+                print(f"[CONTROLNET] Loaded successfully on {DEVICE}")
             except Exception as e:
-                print(f"[CONTROLNET] Load failed: {e} → fallback to no ControlNet")
+                print(f"[CONTROLNET] Load failed: {type(e).__name__}: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                print("[CONTROLNET] Fallback to no ControlNet")
                 use_controlnet = False
 
-        if use_controlnet:
+        if use_controlnet and key in controlnet_pipes:
             p = controlnet_pipes[key]
             print(f"[CONTROLNET] Using {controlnet_type} | type={type(p).__name__}")
 
@@ -604,8 +617,9 @@ def apply_inpaint(
                     guidance_scale=guidance,
                     generator=gen
                 ).images[0]
+                print("[CONTROLNET] Generation success!")
             except Exception as e:
-                print(f"[CONTROLNET] Generation failed: {e} → fallback")
+                print(f"[CONTROLNET] Generation failed: {str(e)} → fallback")
                 use_controlnet = False
 
     if result is None:
