@@ -17,6 +17,7 @@ from diffusers import (
     StableDiffusionXLImg2ImgPipeline
 )
 from diffusers.utils import load_image
+from prompt_enricher import enrich_positive, enrich_negative
 
 # opencv 있으면 더 좋고, 없으면 PIL로만 동작
 try:
@@ -27,6 +28,14 @@ except Exception:
 import cv2
 from PIL import Image
 import gradio as gr
+import gradio as gr
+theme = gr.themes.Soft(
+    primary_hue="blue",
+    secondary_hue="gray",
+    neutral_hue="slate",
+    radius_size="lg",
+    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "sans-serif"]
+)
 import torch
 import traceback
 
@@ -229,6 +238,30 @@ def refine_mask_soft(mask_u8: np.ndarray, expand_px: int, blur_px: int) -> np.nd
 
     return m.astype(np.uint8)
 
+def preview_enriched_prompt(prompt: str, negative: str, auto_enrich: bool, edit_mode: str):
+    """
+    Preview 버튼 클릭 시 enrich된 positive/negative만 계산해서 보여줌
+    실제 생성은 하지 않음
+    """
+    if not prompt.strip():
+        return "Positive prompt is required!"
+
+    positive_final_pos = prompt.strip()
+    positive_final_neg = (negative or "").strip()
+
+    if auto_enrich:
+        positive_final_pos, _ = enrich_positive(prompt)
+        positive_final_neg = enrich_negative(positive_final_neg)
+
+    # enrich 후에도 기본 negative 추가 (필요 시)
+    positive_final_neg = comma_join_unique([positive_final_neg, build_default_negative(edit_mode)])
+
+    preview_text = (
+        f"Positive (enriched):\n{positive_final_pos}\n\n"
+        f"Negative (enriched):\n{positive_final_neg}"
+    )
+    return preview_text
+
 def parse_prompt_simple(prompt: str) -> dict:
     p = (prompt or "").lower()
 
@@ -398,21 +431,21 @@ def build_auto_candidates_v5(prompt: str, auto_enrich: bool, edit_mode: str):
         return [], "Upload an image first.", ""
 
     try:
-        expanded = user_prompt
+        positive_final = user_prompt
         if auto_enrich_flag:
-            expanded, _info = enrich_positive(user_prompt)
-        expanded = normalize_space(expanded)
+            positive_final, _info = enrich_positive(user_prompt)
+        positive_final = normalize_space(positive_final)
     except Exception as e:
         return [], str(e), ""
 
     try:
-        info = parse_prompt_simple(expanded)
+        info = parse_prompt_simple(positive_final)
         target = info.get("target", "top")
     except Exception as e:
-        return [], str(e), expanded
+        return [], str(e), positive_final
 
     if mp_helper is None:
-        return [], "mp_helper unavailable", expanded
+        return [], "mp_helper unavailable", positive_final
 
     try:
         if target == "sleeve":
@@ -440,10 +473,10 @@ def build_auto_candidates_v5(prompt: str, auto_enrich: bool, edit_mode: str):
         STATE["selected_mask"] = c  # 자동 선택
 
         dt = time.time() - t0
-        return [Image.fromarray(c)], f"v5 OK target={target} time={dt:.2f}s", expanded
+        return [Image.fromarray(c)], f"v5 OK target={target} time={dt:.2f}s", positive_final
 
     except Exception as e:
-        return [], str(e), expanded
+        return [], str(e), positive_final
 
 def select_candidate(evt: gr.SelectData):
     idx = evt.index
@@ -502,16 +535,45 @@ def apply_inpaint(
 
     image_pil = STATE["working_pil"].convert("RGB")
 
-    # 프롬프트 enrich
-    expanded = prompt
+    # 프롬프트 처리 (Apply 시점에 실시간 판단)
+    positive_final = (prompt or "").strip()
+    negative_final = (negative or "").strip()
+
     if auto_enrich:
         try:
-            expanded, _ = enrich_positive(prompt)
+            positive_final, _ = enrich_positive(prompt)
         except Exception as e:
-            print(f"[WARN] Prompt enrich failed: {e}")
-            expanded = prompt
+            print(f"[WARN] Positive enrich failed: {e}")
+            positive_final = (prompt or "").strip()
 
-    merged_neg = comma_join_unique([negative or "", build_default_negative(edit_mode)])
+        try:
+            negative_final = enrich_negative(negative_final)
+        except Exception as e:
+            print(f"[WARN] Negative enrich failed: {e}")
+
+    # 기본 negative 항상 추가
+    negative_final = comma_join_unique([negative_final, build_default_negative(edit_mode)])
+
+    # ===================================================
+    # 이후 코드에서는 positive_final, negative_final 사용
+    # (positive_final, negative_final 같은 옛 변수는 모두 제거)
+
+    # 예시: pipe 호출 부분
+    if result is None:
+        if pipe is None:
+            load_pipe()
+
+        print("[INPAINT] Using base Juggernaut XL Inpainting")
+        result = pipe(
+            prompt=positive_final,
+            negative_prompt=negative_final,
+            image=image_pil,
+            mask_image=mask_pil,
+            num_inference_steps=steps,
+            strength=strength,
+            guidance_scale=guidance,
+            generator=gen
+        ).images[0]
 
     # 모드별 clamp
     if edit_mode == "Remove Clothes":
@@ -569,8 +631,8 @@ def apply_inpaint(
 
             try:
                 result = p(
-                    prompt=expanded,
-                    negative_prompt=merged_neg,
+                    prompt=positive_final,
+                    negative_prompt=negative_final,
                     image=image_pil,
                     mask_image=mask_pil,
                     control_image=control_image,
@@ -590,8 +652,8 @@ def apply_inpaint(
 
         print("[INPAINT] Using base Juggernaut XL Inpainting")
         result = pipe(
-            prompt=expanded,
-            negative_prompt=merged_neg,
+            prompt=positive_final,
+            negative_prompt=negative_final,
             image=image_pil,
             mask_image=mask_pil,
             num_inference_steps=steps,
@@ -630,7 +692,7 @@ def apply_inpaint(
                     raise Exception("Skip")
 
             refined = img2img_pipe(
-                prompt=expanded,
+                prompt=positive_final,
                 image=result,
                 strength=0.20,
                 num_inference_steps=10,
@@ -652,7 +714,7 @@ def apply_inpaint(
     model_info = f"Juggernaut XL | ControlNet: {use_controlnet} ({controlnet_type}) | Refine: {do_refine}"
     run_msg = f"완료! {model_info} | Time: {int(dt // 60)}m {int(dt % 60)}s"
 
-    return final_image, run_msg, expanded, model_info
+    return final_image, run_msg, positive_final, model_info
 
 # -----------------------------------------------------------------------------
 # UI
@@ -681,13 +743,6 @@ CSS = """
 """
 
 def build_ui():
-    theme = gr.themes.Soft(
-        primary_hue="orange",
-        secondary_hue="slate",
-        neutral_hue="slate",
-        radius_size="lg",
-    )
-
     with gr.Blocks(title="ImageAI Inpaint Lab") as demo:
         gr.Markdown("## ImageAI Inpaint Lab (Juggernaut XL + ControlNet)")
 
@@ -723,7 +778,15 @@ def build_ui():
                     )
                     prompt = gr.Textbox(lines=3, label="Positive Prompt")
                     negative = gr.Textbox(lines=3, label="Negative Prompt")
-                    expanded_preview = gr.Textbox(lines=7, interactive=False, label="Expanded Prompt")
+                    with gr.Row():
+                        preview_btn = gr.Button("Preview Enriched Prompt", variant="secondary")
+                        preview_output = gr.Textbox(
+                            label="Preview (enriched prompt - Apply 전에 확인용)",
+                            lines=8,
+                            interactive=False,
+                            placeholder="여기에 enrich된 프롬프트가 미리 표시됩니다"
+                        )
+                    positive_final_preview = gr.Textbox(lines=7, interactive=False, label="positive_final Prompt")
 
                 with gr.Group():
                     gr.Markdown("Controls")
@@ -750,8 +813,8 @@ def build_ui():
         # Events
         input_image.upload(fn=on_upload, inputs=[input_image, working_long_side], outputs=[input_image, selected_mask_preview, auto_status, global_status])
         input_image.select(fn=on_manual_click, inputs=[sam_model], outputs=[mask_overlay, selected_mask_preview, auto_status, global_status])
-        btn_auto.click(fn=build_auto_candidates_v5, inputs=[prompt, auto_enrich, edit_mode], outputs=[auto_gallery, auto_status, expanded_preview])
-        auto_gallery.select(fn=select_candidate, outputs=[mask_overlay, selected_mask_preview, auto_status, global_status])
+        btn_auto.click(fn=build_auto_candidates_v5, inputs=[prompt, auto_enrich, edit_mode], outputs=[auto_gallery, auto_status, positive_final_preview])
+        #auto_gallery.select(fn=select_candidate, outputs=[mask_overlay, selected_mask_preview, auto_status, global_status])
         btn_clear.click(fn=clear_mask, outputs=[mask_overlay, selected_mask_preview, auto_gallery, auto_status, global_status])
 
         btn_apply.click(
@@ -760,9 +823,15 @@ def build_ui():
                 prompt, negative, steps, strength, guidance,
                 mask_expand, mask_blur, seed, auto_enrich, edit_mode,
                 use_controlnet, controlnet_type,
-                do_refine  # ← 새로 추가
+                do_refine 
             ],
-            outputs=[output, run_status, expanded_preview, global_status]
+            outputs=[output, run_status, positive_final_preview, global_status]
+        )
+
+        preview_btn.click(
+            fn=preview_enriched_prompt,
+            inputs=[prompt, negative, auto_enrich, edit_mode],
+            outputs=[preview_output]
         )
 
     return demo
@@ -778,9 +847,9 @@ if __name__ == "__main__":
     demo.launch(
         server_name="127.0.0.1",
         server_port=7860,
-        debug=True,               # 디버그 모드 켜서 로그 자세히
+        debug=True,
         share=False,
         prevent_thread_lock=True,
         css=CSS,
-        theme=gr.Theme
-    )
+        theme=theme
+    )   
