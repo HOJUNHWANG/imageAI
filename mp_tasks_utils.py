@@ -1,22 +1,21 @@
-# mp_tasks_utils.py
+# mp_tasks_utils.py (최신 mediapipe Tasks API 0.10+ 호환)
 """
-MediaPipe Tasks API 기반 semantic mask 생성 (0.10+ 호환)
-- SelfieSegmentation + PoseLandmarker 사용
+MediaPipe Tasks API 기반 semantic mask 생성 (0.10.14+)
+- SelfieSegmentation + PoseLandmarker 활용
 - 상의/소매/머리/배경 등 v5 마스크 빌드
 - CPU 환경에서도 동작
 """
 
 import os
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-from PIL import Image, ImageFilter
-# opencv 있으면 더 좋고, 없으면 PIL로만 동작
+
 try:
     import cv2
-except Exception:
+except ImportError:
     cv2 = None
 
 # Label constants (SelfieSegmentation은 foreground/background만)
@@ -24,7 +23,14 @@ LABEL_BG = 0
 LABEL_PERSON = 1
 
 class MPTasksHelper:
+    """
+    MediaPipe Pose + SelfieSegmentation 헬퍼 (Tasks API)
+    - weights_dir에서 모델 파일 자동 검색
+    """
     def __init__(self, weights_dir: str):
+        self.weights_dir = weights_dir
+
+        # SelfieSegmentation Task
         self.seg_options = vision.ImageSegmenterOptions(
             base_options=python.BaseOptions(
                 model_asset_path=os.path.join(weights_dir, "selfie_multiclass_256x256.tflite")
@@ -42,7 +48,6 @@ class MPTasksHelper:
         person = (mask > threshold).astype(np.uint8) * 255
         return person
 
-# 필수 5개 함수 (최소 구현: person mask 기반 ROI 추출)
 def _morph_close(mask: np.ndarray, k: int = 5) -> np.ndarray:
     """Morphological close with fallback."""
     if cv2 is not None:

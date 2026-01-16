@@ -70,12 +70,12 @@ def enrich_positive(text: str | None) -> tuple[str, str]:
     expanded = ", ".join(set(tokens))  # 중복 제거
 
     # CLIP 77 토큰 제한 우회
-    token_list = [tok.strip() for tok in expanded.split(",") if tok.strip()]
+    token_list = expanded.split(", ")
     if len(token_list) > 75:
         mid = len(token_list) // 2
         part1 = ", ".join(token_list[:mid])
         part2 = ", ".join(token_list[mid:])
-        expanded = f"{part1} || {part2}"  # multi-prompt 형식
+        expanded = f"{part1} BREAK {part2}"  # BREAK로 multi-prompt 구분
 
     info = f"target={target}, color={color}, garment={garment}"
     return expanded, info

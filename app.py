@@ -92,7 +92,7 @@ STATE = {
     "auto_mask_candidates": []
 }
 
-# Global pipelines (캐싱)
+# Global pipelines
 pipe = None
 controlnet_pipes = {}
 img2img_pipe = None
@@ -323,6 +323,12 @@ def load_pipe():
                 pipe.disable_model_cpu_offload()
             print("[GPU] Disabled cpu_offload - full GPU acceleration enabled")
 
+            try:
+                pipe.enable_xformers_memory_efficient_attention()
+                print("[OPT] xformers enabled - faster attention")
+            except Exception:
+                print("[OPT] xformers not available (fallback)")
+
         else:
             pipe.to("cpu")
             print("[CPU] Running on CPU - generation will be slow")
@@ -516,10 +522,23 @@ def apply_inpaint(
     controlnet_type: str = "depth",
     do_refine: bool = False
 ):
+    import time
     t0 = time.time()
 
     if MOCK_INPAINT:
-        return None, "MOCK_INPAINT mode (no real generation)", "", "Mock mode active"
+        return None, "MOCK_INPAINT mode", "", "Mock mode active"
+
+    # 변수 초기화 (모든 에러 방지)
+    result = None
+    refined = None
+    gen = None  # generator도 초기화
+    positive_final = (prompt or "").strip()
+    negative_final = (negative or "").strip()
+    expanded_preview = positive_final  # UI에 보여줄 기본값
+
+    # Seed 기반 generator 생성
+    if seed >= 0:
+        gen = torch.Generator(DEVICE).manual_seed(seed)
 
     # 마스크 안전하게 가져오기
     mask_u8 = STATE.get("mask_u8")
@@ -535,16 +554,13 @@ def apply_inpaint(
 
     image_pil = STATE["working_pil"].convert("RGB")
 
-    # 프롬프트 처리 (Apply 시점에 실시간 판단)
-    positive_final = (prompt or "").strip()
-    negative_final = (negative or "").strip()
-
+    # 프롬프트 enrich (Apply 시점 실시간 적용)
     if auto_enrich:
         try:
             positive_final, _ = enrich_positive(prompt)
+            expanded_preview = positive_final  # Preview에 enrich된 버전 보여줌
         except Exception as e:
             print(f"[WARN] Positive enrich failed: {e}")
-            positive_final = (prompt or "").strip()
 
         try:
             negative_final = enrich_negative(negative_final)
@@ -554,39 +570,15 @@ def apply_inpaint(
     # 기본 negative 항상 추가
     negative_final = comma_join_unique([negative_final, build_default_negative(edit_mode)])
 
-    # ===================================================
-    # 이후 코드에서는 positive_final, negative_final 사용
-    # (positive_final, negative_final 같은 옛 변수는 모두 제거)
-
-    # 예시: pipe 호출 부분
-    if result is None:
-        if pipe is None:
-            load_pipe()
-
-        print("[INPAINT] Using base Juggernaut XL Inpainting")
-        result = pipe(
-            prompt=positive_final,
-            negative_prompt=negative_final,
-            image=image_pil,
-            mask_image=mask_pil,
-            num_inference_steps=steps,
-            strength=strength,
-            guidance_scale=guidance,
-            generator=gen
-        ).images[0]
-
-    # 모드별 clamp
+    # 모드별 clamp (Remove Clothes)
     if edit_mode == "Remove Clothes":
         strength = min(max(strength, 0.45), 0.92)
         guidance = max(guidance, 7.0)
         blur_px = max(blur_px, 12)
 
-    gen = torch.Generator(DEVICE).manual_seed(seed) if seed >= 0 else None
-
-    result = None
-
     print(f"[START] Generation start | mode={edit_mode} | controlnet={use_controlnet} | steps={steps}")
 
+    # ControlNet 분기
     if use_controlnet:
         if controlnet_type == "depth":
             repo = CONTROLNET_DEPTH
@@ -597,30 +589,24 @@ def apply_inpaint(
 
         key = f"{controlnet_type}_{strength:.2f}"
         if key not in controlnet_pipes:
-            print(f"[CONTROLNET] Loading {controlnet_type} from: {repo} ... (CPU라 오래 걸릴 수 있음)")
-            print(f"[CONTROLNET] Current RAM usage before load: {psutil.virtual_memory().percent}%")
+            print(f"[CONTROLNET] Loading {controlnet_type} from: {repo}")
             try:
                 controlnet = ControlNetModel.from_pretrained(
                     repo,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
                     use_safetensors=True,
                     local_files_only=True
                 )
-                print("[CONTROLNET] ControlNet loaded! RAM now: {psutil.virtual_memory().percent}%")
-
                 controlnet_pipes[key] = StableDiffusionXLControlNetInpaintPipeline.from_single_file(
                     JUGGERNAUT_INPAINT,
                     controlnet=controlnet,
-                    torch_dtype=torch.float32,
+                    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
                     use_safetensors=True,
                 )
                 controlnet_pipes[key].to(DEVICE)
                 print(f"[CONTROLNET] Loaded successfully on {DEVICE}")
             except Exception as e:
                 print(f"[CONTROLNET] Load failed: {type(e).__name__}: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                print("[CONTROLNET] Fallback to no ControlNet")
                 use_controlnet = False
 
         if use_controlnet and key in controlnet_pipes:
@@ -637,38 +623,44 @@ def apply_inpaint(
                     mask_image=mask_pil,
                     control_image=control_image,
                     controlnet_conditioning_scale=0.65,
-                    num_inference_steps=steps,
+                    num_inference_steps=int(steps),  # ← int로 강제
                     strength=strength,
                     guidance_scale=guidance,
                     generator=gen
                 ).images[0]
+                print("[CONTROLNET] Generation success!")
             except Exception as e:
-                print(f"[CONTROLNET] Generation failed: {str(e)} → fallback")
-                use_controlnet = False
+                print(f"[CONTROLNET] Generation failed: {str(e)} → fallback to base")
+                result = None
 
+    # ControlNet 실패 시 기본 Inpaint
     if result is None:
         if pipe is None:
             load_pipe()
 
         print("[INPAINT] Using base Juggernaut XL Inpainting")
-        result = pipe(
+        try:
+            result = pipe(
             prompt=positive_final,
             negative_prompt=negative_final,
             image=image_pil,
             mask_image=mask_pil,
-            num_inference_steps=steps,
+            num_inference_steps=int(steps),  # ← int로 강제
             strength=strength,
             guidance_scale=guidance,
             generator=gen
         ).images[0]
-
-    print(f"[SUCCESS] First generation completed in {time.time() - t0:.1f}s")
+            print("[INPAINT] Generation success!")
+        except Exception as e:
+            print(f"[INPAINT] Base generation failed: {str(e)}")
+            return None, f"Generation failed: {str(e)}", positive_final, "Error"
 
     # Refine pass
-    refined = result  # 기본값: refine 안 하면 첫 결과 그대로
-    if do_refine:
-        print("[REFINE] Refine pass 시작 (추가 시간 소요)")
+        # Refine pass
+    if do_refine and result is not None:
+        print("[REFINE] Refine pass 시작")
         try:
+            global img2img_pipe  # ← global 선언 (함수 내에서 수정 가능)
             if img2img_pipe is None:
                 model_path = JUGGERNAUT_INPAINT if os.path.exists(JUGGERNAUT_INPAINT) else DEFAULT_MODEL
                 img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_single_file(
@@ -679,18 +671,6 @@ def apply_inpaint(
                 img2img_pipe.to(DEVICE)
                 print("[REFINE] Img2Img pipeline loaded")
 
-            # result 타입 안전 변환
-            if not isinstance(result, Image.Image):
-                print(f"[REFINE] Converting result type: {type(result)} → PIL")
-                if isinstance(result, np.ndarray):
-                    result = Image.fromarray(result)
-                elif isinstance(result, torch.Tensor):
-                    result = result.cpu().clamp(0, 1).permute(1, 2, 0).numpy()
-                    result = Image.fromarray((result * 255).astype(np.uint8))
-                else:
-                    print("[REFINE] Unknown type, skipping refine")
-                    raise Exception("Skip")
-
             refined = img2img_pipe(
                 prompt=positive_final,
                 image=result,
@@ -699,18 +679,16 @@ def apply_inpaint(
                 guidance_scale=guidance,
                 generator=gen
             ).images[0]
-
-            print("[REFINE] Refine pass completed")
+            print("[REFINE] Refine completed")
         except Exception as e:
-            print(f"[REFINE] Skipped due to error: {e}")
+            print(f"[REFINE] Failed: {str(e)} → using first result")
             refined = result
 
-    # 모든 과정 끝난 후 시간 계산 (refine 여부 상관없이 항상 여기서)
+    # 시간 계산 & 반환
     dt = time.time() - t0
-
-    # 결과 이미지 결정
+    steps = int(steps)  # float → int 강제 변환 (20.1 → 20)
+    strength = float(strength)  # strength는 float 그대로 OK
     final_image = refined if do_refine and refined is not None else result
-
     model_info = f"Juggernaut XL | ControlNet: {use_controlnet} ({controlnet_type}) | Refine: {do_refine}"
     run_msg = f"완료! {model_info} | Time: {int(dt // 60)}m {int(dt % 60)}s"
 
