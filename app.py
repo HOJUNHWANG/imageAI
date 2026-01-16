@@ -692,6 +692,19 @@ def apply_inpaint(
     model_info = f"Juggernaut XL | ControlNet: {use_controlnet} ({controlnet_type}) | Refine: {do_refine}"
     run_msg = f"완료! {model_info} | Time: {int(dt // 60)}m {int(dt % 60)}s"
 
+    # 1. VRAM 강제 청소 (OOM 방지)
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()  # 더 확실하게 동기화
+        print("[VRAM] Cleared cache after generation")
+
+    # 2. 마지막 seed 기록 (재실행해도 날아가지 않게)
+    with open("last_seed.txt", "w") as f:
+        f.write(str(seed if seed >= 0 else "random"))
+
+    # 3. (필요 시) 메모리 상태 로그
+    print(f"[MEMORY] VRAM after clear: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+
     return final_image, run_msg, positive_final, model_info
 
 # -----------------------------------------------------------------------------
@@ -777,6 +790,11 @@ def build_ui():
                     strength = gr.Slider(0.3, 0.95, value=0.55, label="Strength (변경 강도)")
                     guidance = gr.Slider(1.0, 12.0, value=7.0, label="Guidance Scale (CFG) - 프롬프트 준수도")
                     seed = gr.Number(value=-1, label="Seed (-1 = random)")
+                    seed_display = gr.Textbox(
+                        label="Used Seed (생성 후 표시)",
+                        interactive=False,
+                        placeholder="생성 후 seed 값이 여기에 표시됩니다"
+                    )
                     use_controlnet = gr.Checkbox(label="Use ControlNet (경계 자연스러움 향상, CPU 느림)", value=False)
                     controlnet_type = gr.Dropdown(["depth", "openpose", "inpaint"], value="depth", label="ControlNet Type")
                     do_refine = gr.Checkbox(label="Refine Pass (추가 10~30분, 퀄리티 ↑, CPU 느림)", value=False, interactive=True)
@@ -803,7 +821,7 @@ def build_ui():
                 use_controlnet, controlnet_type,
                 do_refine 
             ],
-            outputs=[output, run_status, positive_final_preview, global_status]
+            outputs=[output, run_status, positive_final_preview, global_status, seed_display]
         )
 
         preview_btn.click(
