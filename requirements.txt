@@ -16,4 +16,3 @@ timm
 torchvision
 mediapipe
 psutil
-# xformers (GPU optional)

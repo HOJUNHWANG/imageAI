@@ -10,3 +10,24 @@ shirt, t-shirt, clothing, fabric, plastic skin, airbrushed skin, blurry, distort
 bare female torso, feminine athletic build exactly matching original proportions and pose, natural female skin texture with visible pores and subtle skin imperfections, soft subsurface scattering:1.3, perfect skin tone continuity from face neck to torso:1.2, seamless invisible blend at shoulders neckline and arm edges, anatomically correct collarbone and natural female chest shape, delicate skin details, soft natural studio lighting consistent with original image, sharp focus, photorealistic, masterpiece, ultra detailed realistic skin
 
 male body, muscular male chest, body hair on chest, man, boy, shirt, t-shirt, bra, clothing, fabric, plastic skin:1.4, airbrushed skin, overly smooth skin, doll skin, cg render, distorted anatomy, exaggerated curves, asymmetrical torso, skin tone mismatch, lighting mismatch, harsh shadows, seams visible, noise, low detail
+
+
+
+
+natural feminine upper body with realistic human proportions,
+soft natural skin texture with subtle pores and micro details,
+smooth and continuous skin tone matching the original face and neck,
+anatomically natural shape, gentle curves without exaggeration,
+clean seamless blend at clothing edges, no visible seams or artifacts,
+soft ambient lighting consistent with the original photo,
+photorealistic, high detail, DSLR-quality skin realism,
+true-to-life color, natural shadows, realistic depth
+
+
+
+cartoon, anime, illustration, CGI, plastic skin,
+over-smoothed skin, airbrushed texture, waxy surface,
+unnatural anatomy, exaggerated curves, distorted proportions,
+harsh lighting, blown highlights, color mismatch,
+visible seams, patchy blending, inpainting artifacts,
+extra limbs, duplicated body parts, blurry, low detail
